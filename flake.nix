@@ -134,6 +134,23 @@
             wrapProgram $out/bin/audio-plumber \
               --prefix XDG_DATA_DIRS : "${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}" \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath buildDeps}"
+
+            # Install .desktop file and icon so the app appears in launchers
+            mkdir -p $out/share/applications $out/share/icons/hicolor/128x128/apps
+
+            cat > $out/share/applications/audioplumber.desktop <<EOF
+[Desktop Entry]
+Name=AudioPlumber
+Comment=Visual PipeWire audio patchbay
+Exec=$out/bin/audio-plumber
+Icon=audioplumber
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;pipewire;patchbay;routing;virtual;sink;
+StartupNotify=true
+EOF
+
+            cp ${./src-tauri/icons/128x128.png} $out/share/icons/hicolor/128x128/apps/audioplumber.png
           '';
         };
 
