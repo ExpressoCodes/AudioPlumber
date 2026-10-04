@@ -273,6 +273,20 @@ header h1 {
   filter: url(#glow);
 }
 
+/* Tentative "rubber-band" cable shown while a connection is being formed.
+   Same curve as real cables, but dashed, dimmed and neutral to read as "in progress". */
+.cable-svg path.cable-dangling {
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dasharray: 7 6;
+  opacity: 0.55;
+  pointer-events: none;
+  cursor: default;
+  filter: url(#glow);
+}
+
 /* ─── Node cards ────────────────────────────────────────────────────── */
 .node-card {
   background: var(--surface);

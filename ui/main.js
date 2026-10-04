@@ -18,7 +18,12 @@ let links      = [];  // [{ from, to }]
 let virtualSinks    = [];       // [{ name, moduleId }]
 let nodeDescriptions = new Map(); // node.name → human-readable description from pw-dump
 
-let selectedOutput   = null;  // null | { bundled: false, portId: string } | { bundled: true, portIds: string[] }
+// A pending connection has exactly one endpoint selected, waiting for a
+// complementary click on the other side to complete it. The endpoint may be on
+// either side ('output' = left/virtual-sink monitor, 'input' = right/real output).
+let pending          = null;  // null | { side: 'output'|'input', portInfo, dotEl }
+let danglingPath     = null;  // the live SVG <path> that follows the cursor while pending
+let pendingMouse     = null;  // { x, y } last cursor position (client coords) while pending
 let autoRefreshTimer = null;
 let simpleMode       = true;  // toggle between simple (bundled) and advanced (per-port) modes
 
@@ -376,28 +381,55 @@ function renderRightColumn() {
 function renderAll() {
   renderLeftColumn();
   renderRightColumn();
+  reapplyPendingSelection();
 }
 
 // ─── Port click logic ─────────────────────────────────────────────────────────
+// Connections can be initiated from EITHER side. The first clicked endpoint
+// becomes "pending"; clicking a complementary endpoint on the other side
+// completes the connection (output->input, identical regardless of start order).
 function onPortClick(portInfo, side, dotEl) {
-  if (side === 'output') {
-    clearSelectedOutput();
-    selectedOutput = portInfo;
-    dotEl.classList.add('selected');
-    const label = portInfo.bundled
-      ? portInfo.portIds.join(', ')
-      : portInfo.portId;
-    setStatus(`Selected: ${label} — now click an output port on the right`);
-  } else if (side === 'input') {
-    if (!selectedOutput) {
-      setStatus('Click a virtual sink monitor port first, then an output port to connect.', true);
-      return;
-    }
+  // No pending selection yet -> begin a pending connection from this endpoint.
+  if (!pending) {
+    selectEndpoint(portInfo, side, dotEl);
+    return;
+  }
 
-    if (selectedOutput.bundled && portInfo.bundled) {
+  // Clicking the already-selected endpoint again -> cancel.
+  if (pending.dotEl === dotEl) {
+    clearSelectedOutput();
+    return;
+  }
+
+  // Clicking another endpoint on the SAME side -> move the selection there.
+  if (pending.side === side) {
+    selectEndpoint(portInfo, side, dotEl);
+    return;
+  }
+
+  // Complementary side -> complete the connection.
+  const outputInfo = side === 'output' ? portInfo : pending.portInfo;
+  const inputInfo  = side === 'input'  ? portInfo : pending.portInfo;
+  completeConnection(outputInfo, inputInfo);
+}
+
+function selectEndpoint(portInfo, side, dotEl) {
+  clearSelectedOutput();
+  pending = { side, portInfo, dotEl };
+  dotEl.classList.add('selected');
+  const label = portInfo.bundled ? portInfo.portIds.join(', ') : portInfo.portId;
+  setStatus(`Selected: ${label}`);
+  startDanglingCable();
+}
+
+// Perform the actual connect. `outputInfo` is always the virtual-sink/monitor
+// (left) endpoint and `inputInfo` the real output (right) endpoint, so the
+// pw-link call is identical no matter which side initiated.
+function completeConnection(outputInfo, inputInfo) {
+    if (outputInfo.bundled && inputInfo.bundled) {
       // Simple mode: pair up ports by sorted order
-      const fromPorts = selectedOutput.portIds.slice().sort();
-      const toPorts   = portInfo.portIds.slice().sort();
+      const fromPorts = outputInfo.portIds.slice().sort();
+      const toPorts   = inputInfo.portIds.slice().sort();
       const pairs = fromPorts
         .map((f, i) => ({ from: f, to: toPorts[i] }))
         .filter(p => p.from && p.to);
@@ -415,10 +447,10 @@ function onPortClick(portInfo, side, dotEl) {
           showErrorBanner(`Connect failed: ${err}`);
           setStatus(`Connect failed: ${err}`, true);
         });
-    } else if (!selectedOutput.bundled && !portInfo.bundled) {
+    } else if (!outputInfo.bundled && !inputInfo.bundled) {
       // Advanced mode: single port connect
-      const from = selectedOutput.portId;
-      const to   = portInfo.portId;
+      const from = outputInfo.portId;
+      const to   = inputInfo.portId;
       clearSelectedOutput();
       setStatus('Connecting\u2026');
       invoke('connect', { from, to })
@@ -436,12 +468,33 @@ function onPortClick(portInfo, side, dotEl) {
       clearSelectedOutput();
       setStatus('Mode mismatch — please click a matching port type.', true);
     }
-  }
 }
 
+// Cancels any pending connection and clears all selection / dangling-cable
+// state. (Name retained: called from refresh, mode toggle, cable click/disconnect,
+// empty-canvas click, and Escape.)
 function clearSelectedOutput() {
-  selectedOutput = null;
+  pending = null;
   document.querySelectorAll('.port-dot.selected').forEach(el => el.classList.remove('selected'));
+  removeDanglingCable();
+}
+
+// After a re-render (refresh rebuilds the port DOM), re-resolve the pending
+// endpoint's dot element and re-apply the selection highlight, so the dangling
+// cable anchors to the live element instead of a detached one. If the endpoint
+// no longer exists (e.g. its virtual sink was deleted), cancel the pending state.
+function reapplyPendingSelection() {
+  if (!pending) return;
+  const { side, portInfo } = pending;
+  const dot = portInfo.bundled
+    ? document.querySelector(`.port-dot[data-port-ids="${CSS.escape(portInfo.portIds.join(','))}"][data-side="${side}"]`)
+    : document.querySelector(`.port-dot[data-port-id="${CSS.escape(portInfo.portId)}"][data-side="${side}"]`);
+  if (dot) {
+    pending.dotEl = dot;
+    dot.classList.add('selected');
+  } else {
+    clearSelectedOutput();
+  }
 }
 
 // ─── Connection persistence helpers ──────────────────────────────────────────
@@ -476,10 +529,16 @@ function getNodePortCenter(nodeName, side) {
   };
 }
 
+// Shared bezier shape helper — the real cables and the dangling cable use the
+// exact same curve so the tentative cable reads like a real patch cable.
+function cablePathD(from, to) {
+  const dx = Math.abs(to.x - from.x) * 0.5;
+  return `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`;
+}
+
 function drawCable(from, to, color, cableData) {
   if (!from || !to) return;
-  const dx  = Math.abs(to.x - from.x) * 0.5;
-  const d   = `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`;
+  const d = cablePathD(from, to);
 
   const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
   path.setAttribute('class', 'cable');
@@ -554,6 +613,63 @@ function drawCables() {
       if (dot) dot.classList.add('connected');
     });
   }
+
+  // Keep the tentative cable in sync whenever cables are redrawn (refresh,
+  // scroll, resize) so it tracks the moved anchor under the current cursor.
+  if (pending) renderDanglingCable();
+}
+
+// ─── Dangling "rubber-band" cable (follows cursor while a connection is pending) ─
+// Centre of a port dot, in the SVG's coordinate space (matches getPortCenter).
+function dotCenter(dotEl) {
+  const rect    = dotEl.getBoundingClientRect();
+  const svgRect = cableSvg.getBoundingClientRect();
+  return {
+    x: rect.left + rect.width  / 2 - svgRect.left,
+    y: rect.top  + rect.height / 2 - svgRect.top,
+  };
+}
+
+function startDanglingCable() {
+  removeDanglingCable();
+  if (!pending) return;
+  danglingPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  danglingPath.setAttribute('class', 'cable-dangling');
+  cableSvg.appendChild(danglingPath);
+  // Draw a zero-length stub at the anchor until the first mouse move.
+  const anchor = dotCenter(pending.dotEl);
+  danglingPath.setAttribute('d', cablePathD(anchor, anchor));
+  // Listener is attached ONLY while a connection is pending, and removed on
+  // cancel/complete — no permanent high-frequency listener is leaked.
+  document.addEventListener('mousemove', onMouseMoveDangling);
+}
+
+function onMouseMoveDangling(ev) {
+  if (!pending) return;  // cheap early-return guard
+  pendingMouse = { x: ev.clientX, y: ev.clientY };
+  renderDanglingCable();
+}
+
+function renderDanglingCable() {
+  if (!danglingPath || !pending) return;
+  const anchor  = dotCenter(pending.dotEl);
+  let free = anchor;
+  if (pendingMouse) {
+    const svgRect = cableSvg.getBoundingClientRect();
+    free = { x: pendingMouse.x - svgRect.left, y: pendingMouse.y - svgRect.top };
+  }
+  // Curve from whichever side initiated: an output anchor leaves rightward
+  // toward the cursor; an input anchor is approached from the left.
+  const ends = pending.side === 'output'
+    ? { from: anchor, to: free }
+    : { from: free,   to: anchor };
+  danglingPath.setAttribute('d', cablePathD(ends.from, ends.to));
+}
+
+function removeDanglingCable() {
+  document.removeEventListener('mousemove', onMouseMoveDangling);
+  if (danglingPath) { danglingPath.remove(); danglingPath = null; }
+  pendingMouse = null;
 }
 
 // ─── Cable click (disconnect) ─────────────────────────────────────────────────
@@ -718,6 +834,8 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeVsinkModal();
+    // Cancel any pending connection and remove the dangling cable.
+    clearSelectedOutput();
   }
   if (e.key === 'd' || e.key === 'D') {
     // Don't trigger when typing in an input
