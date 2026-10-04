@@ -109,8 +109,9 @@
           version = "0.1.0";
           src = ./.;
 
-          # Cargo.lock lives in src-tauri/
+          # Cargo.lock lives in src-tauri/ — copy it to root where buildRustPackage expects it
           cargoLock.lockFile = ./src-tauri/Cargo.lock;
+          postPatch = "cp src-tauri/Cargo.lock Cargo.lock";
 
           # Build only the src-tauri subdirectory
           buildAndTestSubdir = "src-tauri";
@@ -118,8 +119,15 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             gobject-introspection
-            wrapGAppsHook3  # wraps the binary with GTK/GSettings env
+            wrapGAppsHook3  # wraps the binary with GTK/GSettings env; do NOT also call wrapProgram manually
           ];
+
+          # Pass extra env to wrapGAppsHook3 instead of calling wrapProgram ourselves
+          preFixup = ''
+            gappsWrapperArgs+=(
+              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath buildDeps}"
+            )
+          '';
 
           # Reuse the shared buildDeps list
           buildInputs = buildDeps;
@@ -131,10 +139,6 @@
           PKG_CONFIG_PATH = with pkgs; lib.makeSearchPathOutput "dev" "lib/pkgconfig" buildDeps;
 
           postInstall = ''
-            wrapProgram $out/bin/audio-plumber \
-              --prefix XDG_DATA_DIRS : "${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}" \
-              --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath buildDeps}"
-
             # Install .desktop file and icon so the app appears in launchers
             mkdir -p $out/share/applications $out/share/icons/hicolor/128x128/apps
 
@@ -168,14 +172,16 @@ EOF
       # -------------------------------------------------------------------- #
       # nixosModules must be top-level (not inside eachDefaultSystem) because
       # NixOS modules are architecture-independent declarations.
-      nixosModules.default = { config, lib, pkgs, ... }: {
+      nixosModules.default = { config, lib, pkgs, system ? pkgs.system, ... }: {
         options.programs.audioplumber.enable =
           lib.mkEnableOption "AudioPlumber visual PipeWire patchbay";
 
         config = lib.mkIf config.programs.audioplumber.enable {
           environment.systemPackages = [
-            self.packages.${pkgs.system}.default
+            self.packages.${system}.default
           ];
+          # Ensure icon cache is updated so the launcher icon shows
+          environment.pathsToLink = [ "/share/icons" "/share/applications" ];
         };
       };
     };
