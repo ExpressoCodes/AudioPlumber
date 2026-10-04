@@ -175,7 +175,8 @@ EOF
       # -------------------------------------------------------------------- #
       # nixosModules must be top-level (not inside eachDefaultSystem) because
       # NixOS modules are architecture-independent declarations.
-      nixosModules.default = { config, lib, pkgs, system ? pkgs.system, ... }: {
+      nixosModules.default = { config, lib, pkgs, ... }:
+        let system = pkgs.stdenv.hostPlatform.system; in {
         options.programs.audioplumber.enable =
           lib.mkEnableOption "AudioPlumber visual PipeWire patchbay";
 
