@@ -177,8 +177,15 @@ EOF
       # NixOS modules are architecture-independent declarations.
       nixosModules.default = { config, lib, pkgs, ... }:
         let system = pkgs.stdenv.hostPlatform.system; in {
-        options.programs.audioplumber.enable =
-          lib.mkEnableOption "AudioPlumber visual PipeWire patchbay";
+        options.programs.audioplumber.enable = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = ''
+            Whether to install the AudioPlumber visual PipeWire patchbay.
+            Enabled by default: importing this module is enough to install
+            the app. Set to false to opt out.
+          '';
+        };
 
         config = lib.mkIf config.programs.audioplumber.enable {
           environment.systemPackages = [
