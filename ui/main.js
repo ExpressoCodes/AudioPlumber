@@ -1,0 +1,783 @@
+// AudioPlumber — main.js
+// Simplified patchbay: virtual sinks on the left, real outputs on the right
+
+// ─── Tauri IPC ───────────────────────────────────────────────────────────────
+// Tauri 2 exposes invoke via window.__TAURI__.core
+function invoke(cmd, args = {}) {
+  return window.__TAURI__.core.invoke(cmd, args);
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const VIRTUAL_SINKS_KEY = 'audioplumber_virtual_sinks';
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let allOutputs = [];  // [{ node, port, id }] — all PipeWire output ports (pw-link -o)
+let allInputs  = [];  // [{ node, port, id }] — all PipeWire input ports (pw-link -i)
+let links      = [];  // [{ from, to }]
+
+let virtualSinks    = [];       // [{ name, moduleId }]
+let nodeDescriptions = new Map(); // node.name → human-readable description from pw-dump
+
+let selectedOutput   = null;  // null | { bundled: false, portId: string } | { bundled: true, portIds: string[] }
+let autoRefreshTimer = null;
+let simpleMode       = true;  // toggle between simple (bundled) and advanced (per-port) modes
+
+// ─── Virtual sinks persistence ────────────────────────────────────────────────
+function loadVirtualSinks() {
+  try {
+    const raw = localStorage.getItem(VIRTUAL_SINKS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      virtualSinks = Array.isArray(parsed) ? parsed : [];
+    }
+  } catch (_) { /* ignore corrupt data */ }
+}
+
+function saveVirtualSinks() {
+  localStorage.setItem(VIRTUAL_SINKS_KEY, JSON.stringify(virtualSinks));
+}
+
+// ─── DOM helpers ──────────────────────────────────────────────────────────────
+const outputsList = document.getElementById('outputs-list');
+const inputsList  = document.getElementById('inputs-list');
+const cableSvg    = document.getElementById('cable-svg');
+const btnRefresh  = document.getElementById('btn-refresh');
+const statusMsg   = document.getElementById('status-msg');
+const btnNewVsink = document.getElementById('btn-new-vsink');
+const btnModeToggle = document.getElementById('btn-mode-toggle');
+const debugPanel  = document.getElementById('debug-panel');
+
+const errorBanner      = document.getElementById('error-banner');
+const errorBannerMsg   = document.getElementById('error-banner-msg');
+const errorBannerClose = document.getElementById('error-banner-close');
+
+// Modal — virtual sink
+const modalVsink       = document.getElementById('modal-vsink');
+const vsinkNameInput   = document.getElementById('vsink-name-input');
+const modalVsinkCancel = document.getElementById('modal-vsink-cancel');
+const modalVsinkConfirm = document.getElementById('modal-vsink-confirm');
+
+// ─── Error banner ─────────────────────────────────────────────────────────────
+function showErrorBanner(msg) {
+  errorBannerMsg.textContent = msg;
+  errorBanner.style.display = 'flex';
+}
+
+function hideErrorBanner() {
+  errorBanner.style.display = 'none';
+  errorBannerMsg.textContent = '';
+}
+
+errorBannerClose.addEventListener('click', hideErrorBanner);
+
+function setStatus(msg, isError = false) {
+  statusMsg.textContent = msg;
+  statusMsg.classList.toggle('error', isError);
+}
+
+// ─── Cable colour palette ─────────────────────────────────────────────────────
+const CABLE_COLORS = [
+  '#53d8fb', '#ff6b9d', '#a8ff78', '#ffde59',
+  '#c77dff', '#ff9f43', '#48dbfb', '#ffeaa7',
+];
+function cableColor(index) {
+  return CABLE_COLORS[index % CABLE_COLORS.length];
+}
+
+// ─── Group ports by node ──────────────────────────────────────────────────────
+function groupByNode(ports) {
+  const map = new Map();
+  for (const p of ports) {
+    if (!map.has(p.node)) map.set(p.node, []);
+    map.get(p.node).push(p);
+  }
+  return map;
+}
+
+// ─── Node name from port ID ───────────────────────────────────────────────────
+function nodeNameFromPortId(portId) {
+  const colonIdx = portId.indexOf(':');
+  return colonIdx >= 0 ? portId.slice(0, colonIdx) : portId;
+}
+
+// ─── Mode toggle ──────────────────────────────────────────────────────────────
+function updateModeToggleLabel() {
+  if (btnModeToggle) {
+    btnModeToggle.textContent = simpleMode ? '\u2699 Advanced' : '\u25ce Simple';
+    btnModeToggle.title = simpleMode
+      ? 'Switch to Advanced mode (individual ports)'
+      : 'Switch to Simple mode (bundled stereo)';
+  }
+}
+
+if (btnModeToggle) {
+  btnModeToggle.addEventListener('click', () => {
+    simpleMode = !simpleMode;
+    clearSelectedOutput();
+    updateModeToggleLabel();
+    renderAll();
+    requestAnimationFrame(() => requestAnimationFrame(drawCables));
+  });
+}
+
+// ─── Port dot listeners (click + right-click to disconnect) ──────────────────
+function addPortDotListeners(dot, portInfo, side) {
+  dot.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    onPortClick(portInfo, side, dot);
+  });
+
+  dot.addEventListener('contextmenu', async (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    // Collect port IDs to disconnect (simple mode: all ports in the node; advanced: just this port)
+    let portIds;
+    if (dot.dataset.portIds) {
+      portIds = dot.dataset.portIds.split(',');
+    } else {
+      portIds = [dot.dataset.portId];
+    }
+
+    // Find all links involving any of these port IDs
+    const toDisconnect = links.filter(l =>
+      portIds.includes(l.from) || portIds.includes(l.to)
+    );
+
+    if (toDisconnect.length === 0) {
+      setStatus('No connections on this port.', true);
+      return;
+    }
+
+    setStatus(`Removing ${toDisconnect.length} connection(s)…`);
+    const errors = [];
+    for (const link of toDisconnect) {
+      try {
+        await invoke('disconnect', { from: link.from, to: link.to });
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+
+    if (errors.length > 0) {
+      showErrorBanner(`Disconnect failed: ${errors.join('; ')}`);
+    } else {
+      setStatus(`Removed ${toDisconnect.length} connection(s)`);
+    }
+
+    await refresh();
+    await saveCurrentLinks();
+  });
+}
+
+// ─── Render left column: virtual sink cards ───────────────────────────────────
+// Virtual sink monitor ports come from get_outputs() (pw-link -o)
+// Node names are AudioPlumber_{name}, but we do a fuzzy lookup in case PipeWire
+// appends a suffix like AudioPlumber_Foo.2 or AudioPlumber_Foo_1.
+function renderLeftColumn() {
+  outputsList.innerHTML = '';
+
+  if (virtualSinks.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = 'No virtual sinks yet. Click "\uFF0B New Virtual Sink" to create one.';
+    outputsList.appendChild(empty);
+    return;
+  }
+
+  for (const vs of virtualSinks) {
+    const nodeName = `AudioPlumber_${vs.name}`;
+
+    // Fuzzy lookup: exact match OR PipeWire-appended suffix variants
+    const ports = allOutputs.filter(p =>
+      p.node === nodeName ||
+      p.node.startsWith(nodeName + '.') ||
+      p.node.startsWith(nodeName + '_')
+    );
+
+    const card = document.createElement('div');
+    card.className = 'node-card node-card-virtual';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'node-name';
+    nameEl.textContent = vs.name;
+    nameEl.title = nodeName;
+    card.appendChild(nameEl);
+
+    if (ports.length === 0) {
+      const pending = document.createElement('div');
+      pending.className = 'port-row';
+      pending.style.padding = '4px 14px';
+      pending.style.fontSize = '11px';
+      pending.style.color = 'var(--text-dim)';
+      pending.style.fontStyle = 'italic';
+      pending.textContent = 'Waiting for PipeWire\u2026';
+      card.appendChild(pending);
+    } else if (simpleMode) {
+      // Simple mode: one bundled dot for all ports of this node
+      // Use the actual node name from the first matched port
+      const actualNodeName = ports[0].node;
+      const portIds = ports.map(p => p.id);
+
+      const row = document.createElement('div');
+      row.className = 'port-row';
+
+      const dot = document.createElement('div');
+      dot.className = 'port-dot';
+      dot.dataset.portIds = portIds.join(',');
+      dot.dataset.node = actualNodeName;
+      dot.dataset.side = 'output';
+      dot.title = portIds.join(', ');
+
+      const label = document.createElement('div');
+      label.className = 'port-name';
+      label.textContent = vs.name;
+      label.title = vs.name;
+
+      row.appendChild(dot);
+      row.appendChild(label);
+      card.appendChild(row);
+
+      addPortDotListeners(dot, { bundled: true, portIds }, 'output');
+    } else {
+      // Advanced mode: individual port dots
+      for (const p of ports) {
+        const row = document.createElement('div');
+        row.className = 'port-row';
+
+        const dot = document.createElement('div');
+        dot.className = 'port-dot';
+        dot.dataset.portId = p.id;
+        dot.dataset.node = p.node;
+        dot.dataset.side = 'output';
+        dot.title = p.id;
+
+        const label = document.createElement('div');
+        label.className = 'port-name';
+        label.textContent = p.port;
+        label.title = p.port;
+
+        row.appendChild(dot);
+        row.appendChild(label);
+        card.appendChild(row);
+
+        addPortDotListeners(dot, { bundled: false, portId: p.id }, 'output');
+      }
+    }
+
+    // Delete button — hover-reveal red button
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'btn-delete-sink';
+    deleteBtn.textContent = 'Delete sink';
+    deleteBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      doDeleteVirtualSink(vs);
+    });
+    card.appendChild(deleteBtn);
+
+    outputsList.appendChild(card);
+  }
+}
+
+// ─── Render right column: real audio outputs ──────────────────────────────────
+// Real outputs come from get_inputs() (pw-link -i) — PipeWire sink playback ports.
+// Filters out virtual sinks, MIDI nodes, internal capture devices, and any node
+// that doesn't have at least one stereo audio port.
+const STEREO_PORT_NAMES = new Set(['playback_FL', 'playback_FR', 'capture_FL', 'capture_FR']);
+
+function renderRightColumn() {
+  inputsList.innerHTML = '';
+
+  const portsByNode = groupByNode(allInputs);
+
+  // Filter to real, stereo playback/capture sinks only
+  const filteredEntries = [];
+  for (const [nodeName, ports] of portsByNode) {
+    if (nodeName.startsWith('AudioPlumber_')) continue;
+    if (nodeName.toLowerCase().includes('midi')) continue;
+    if (/^bluez_capture_internal/i.test(nodeName)) continue;
+    // Must have at least one recognised stereo audio port
+    if (!ports.some(p => STEREO_PORT_NAMES.has(p.port))) continue;
+    filteredEntries.push([nodeName, ports]);
+  }
+
+  if (filteredEntries.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.textContent = 'No audio outputs found. Is PipeWire running?';
+    inputsList.appendChild(empty);
+    return;
+  }
+
+  for (const [nodeName, ports] of filteredEntries) {
+    const displayName = nodeDescriptions.get(nodeName) || nodeName;
+
+    const card = document.createElement('div');
+    card.className = 'node-card';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'node-name';
+    nameEl.textContent = displayName;
+    nameEl.title = nodeName;  // raw PipeWire name as tooltip
+    card.appendChild(nameEl);
+
+    if (simpleMode) {
+      // Simple mode: one bundled dot for all ports of this node
+      const portIds = ports.map(p => p.id);
+
+      const row = document.createElement('div');
+      row.className = 'port-row';
+
+      const dot = document.createElement('div');
+      dot.className = 'port-dot';
+      dot.dataset.portIds = portIds.join(',');
+      dot.dataset.node = nodeName;
+      dot.dataset.side = 'input';
+      dot.title = portIds.join(', ');
+
+      const label = document.createElement('div');
+      label.className = 'port-name';
+      label.textContent = displayName;
+      label.title = displayName;
+
+      row.appendChild(dot);
+      row.appendChild(label);
+      card.appendChild(row);
+
+      addPortDotListeners(dot, { bundled: true, portIds }, 'input');
+    } else {
+      // Advanced mode: individual port dots
+      for (const p of ports) {
+        const row = document.createElement('div');
+        row.className = 'port-row';
+
+        const dot = document.createElement('div');
+        dot.className = 'port-dot';
+        dot.dataset.portId = p.id;
+        dot.dataset.node = p.node;
+        dot.dataset.side = 'input';
+        dot.title = p.id;
+
+        const label = document.createElement('div');
+        label.className = 'port-name';
+        label.textContent = p.port;
+        label.title = p.port;
+
+        row.appendChild(dot);
+        row.appendChild(label);
+        card.appendChild(row);
+
+        addPortDotListeners(dot, { bundled: false, portId: p.id }, 'input');
+      }
+    }
+
+    inputsList.appendChild(card);
+  }
+}
+
+function renderAll() {
+  renderLeftColumn();
+  renderRightColumn();
+}
+
+// ─── Port click logic ─────────────────────────────────────────────────────────
+function onPortClick(portInfo, side, dotEl) {
+  if (side === 'output') {
+    clearSelectedOutput();
+    selectedOutput = portInfo;
+    dotEl.classList.add('selected');
+    const label = portInfo.bundled
+      ? portInfo.portIds.join(', ')
+      : portInfo.portId;
+    setStatus(`Selected: ${label} — now click an output port on the right`);
+  } else if (side === 'input') {
+    if (!selectedOutput) {
+      setStatus('Click a virtual sink monitor port first, then an output port to connect.', true);
+      return;
+    }
+
+    if (selectedOutput.bundled && portInfo.bundled) {
+      // Simple mode: pair up ports by sorted order
+      const fromPorts = selectedOutput.portIds.slice().sort();
+      const toPorts   = portInfo.portIds.slice().sort();
+      const pairs = fromPorts
+        .map((f, i) => ({ from: f, to: toPorts[i] }))
+        .filter(p => p.from && p.to);
+
+      clearSelectedOutput();
+      setStatus('Connecting\u2026');
+
+      Promise.all(pairs.map(p => invoke('connect', { from: p.from, to: p.to })))
+        .then(() => {
+          setStatus(`Connected ${pairs.length} port(s)`);
+          return refresh();
+        })
+        .then(() => saveCurrentLinks())
+        .catch((err) => {
+          showErrorBanner(`Connect failed: ${err}`);
+          setStatus(`Connect failed: ${err}`, true);
+        });
+    } else if (!selectedOutput.bundled && !portInfo.bundled) {
+      // Advanced mode: single port connect
+      const from = selectedOutput.portId;
+      const to   = portInfo.portId;
+      clearSelectedOutput();
+      setStatus('Connecting\u2026');
+      invoke('connect', { from, to })
+        .then(() => {
+          setStatus(`Connected: ${from} \u2192 ${to}`);
+          return refresh();
+        })
+        .then(() => saveCurrentLinks())
+        .catch((err) => {
+          showErrorBanner(`Connect failed: ${err}`);
+          setStatus(`Connect failed: ${err}`, true);
+        });
+    } else {
+      // Mixed mode (shouldn't normally happen, but handle gracefully)
+      clearSelectedOutput();
+      setStatus('Mode mismatch — please click a matching port type.', true);
+    }
+  }
+}
+
+function clearSelectedOutput() {
+  selectedOutput = null;
+  document.querySelectorAll('.port-dot.selected').forEach(el => el.classList.remove('selected'));
+}
+
+// ─── Connection persistence helpers ──────────────────────────────────────────
+async function saveCurrentLinks() {
+  try {
+    await invoke('save_connections', { connections: links });
+  } catch (err) {
+    console.warn('Failed to save connections:', err);
+  }
+}
+
+// ─── Cable drawing ────────────────────────────────────────────────────────────
+function getPortCenter(portId) {
+  const dot = document.querySelector(`.port-dot[data-port-id="${CSS.escape(portId)}"]`);
+  if (!dot) return null;
+  const rect    = dot.getBoundingClientRect();
+  const svgRect = cableSvg.getBoundingClientRect();
+  return {
+    x: rect.left + rect.width  / 2 - svgRect.left,
+    y: rect.top  + rect.height / 2 - svgRect.top,
+  };
+}
+
+function getNodePortCenter(nodeName, side) {
+  const dot = document.querySelector(`.port-dot[data-node="${CSS.escape(nodeName)}"][data-side="${side}"]`);
+  if (!dot) return null;
+  const rect    = dot.getBoundingClientRect();
+  const svgRect = cableSvg.getBoundingClientRect();
+  return {
+    x: rect.left + rect.width  / 2 - svgRect.left,
+    y: rect.top  + rect.height / 2 - svgRect.top,
+  };
+}
+
+function drawCable(from, to, color, cableData) {
+  if (!from || !to) return;
+  const dx  = Math.abs(to.x - from.x) * 0.5;
+  const d   = `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`;
+
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('class', 'cable');
+  path.setAttribute('d', d);
+  path.setAttribute('stroke', color);
+  Object.assign(path.dataset, cableData);
+  path.style.pointerEvents = 'stroke';
+
+  path.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (cableData.fromNode && cableData.toNode) {
+      onNodeCableClick(cableData.fromNode, cableData.toNode, path);
+    } else {
+      onCableClick(cableData.from, cableData.to, path);
+    }
+  });
+
+  cableSvg.appendChild(path);
+}
+
+function drawCables() {
+  cableSvg.querySelectorAll('path.cable').forEach(p => p.remove());
+
+  if (simpleMode) {
+    // Simple mode: one cable per unique (fromNode, toNode) pair
+    const nodePairs = new Map(); // "fromNode|toNode" → index
+    for (const link of links) {
+      const fromNode = nodeNameFromPortId(link.from);
+      const toNode   = nodeNameFromPortId(link.to);
+      const key = `${fromNode}|${toNode}`;
+      if (!nodePairs.has(key)) {
+        nodePairs.set(key, nodePairs.size);
+      }
+    }
+
+    let colorIdx = 0;
+    for (const [key, idx] of nodePairs) {
+      const [fromNode, toNode] = key.split('|');
+      const from = getNodePortCenter(fromNode, 'output');
+      const to   = getNodePortCenter(toNode,   'input');
+      const color = cableColor(colorIdx++);
+      drawCable(from, to, color, { fromNode, toNode });
+    }
+
+    // Mark connected bundled dots
+    document.querySelectorAll('.port-dot.connected').forEach(el => el.classList.remove('connected'));
+    const connectedNodes = { output: new Set(), input: new Set() };
+    for (const link of links) {
+      connectedNodes.output.add(nodeNameFromPortId(link.from));
+      connectedNodes.input.add(nodeNameFromPortId(link.to));
+    }
+    document.querySelectorAll('.port-dot[data-node][data-side="output"]').forEach(dot => {
+      if (connectedNodes.output.has(dot.dataset.node)) dot.classList.add('connected');
+    });
+    document.querySelectorAll('.port-dot[data-node][data-side="input"]').forEach(dot => {
+      if (connectedNodes.input.has(dot.dataset.node)) dot.classList.add('connected');
+    });
+  } else {
+    // Advanced mode: one cable per link
+    links.forEach((link, index) => {
+      const from = getPortCenter(link.from);
+      const to   = getPortCenter(link.to);
+      const color = cableColor(index);
+      drawCable(from, to, color, { from: link.from, to: link.to });
+    });
+
+    // Mark connected port dots
+    document.querySelectorAll('.port-dot.connected').forEach(el => el.classList.remove('connected'));
+    const connectedIds = new Set(links.flatMap(l => [l.from, l.to]));
+    connectedIds.forEach(id => {
+      const dot = document.querySelector(`.port-dot[data-port-id="${CSS.escape(id)}"]`);
+      if (dot) dot.classList.add('connected');
+    });
+  }
+}
+
+// ─── Cable click (disconnect) ─────────────────────────────────────────────────
+function onCableClick(from, to, pathEl) {
+  clearSelectedOutput();
+  setStatus(`Disconnecting: ${from} \u2192 ${to}\u2026`);
+  pathEl.style.opacity = '0.3';
+  invoke('disconnect', { from, to })
+    .then(() => {
+      setStatus(`Disconnected: ${from} \u2192 ${to}`);
+      return refresh();
+    })
+    .then(() => saveCurrentLinks())
+    .catch((err) => {
+      showErrorBanner(`Disconnect failed: ${err}`);
+      setStatus(`Disconnect failed: ${err}`, true);
+      pathEl.style.opacity = '';
+    });
+}
+
+// ─── Node-level cable click (simple mode — disconnect all in pair) ────────────
+function onNodeCableClick(fromNode, toNode, pathEl) {
+  clearSelectedOutput();
+  const pairsToDisconnect = links.filter(
+    l => nodeNameFromPortId(l.from) === fromNode && nodeNameFromPortId(l.to) === toNode
+  );
+  if (pairsToDisconnect.length === 0) return;
+
+  setStatus(`Disconnecting: ${fromNode} \u2192 ${toNode}\u2026`);
+  pathEl.style.opacity = '0.3';
+
+  Promise.all(pairsToDisconnect.map(l => invoke('disconnect', { from: l.from, to: l.to })))
+    .then(() => {
+      setStatus(`Disconnected: ${fromNode} \u2192 ${toNode}`);
+      return refresh();
+    })
+    .then(() => saveCurrentLinks())
+    .catch((err) => {
+      showErrorBanner(`Disconnect failed: ${err}`);
+      setStatus(`Disconnect failed: ${err}`, true);
+      pathEl.style.opacity = '';
+    });
+}
+
+// ─── Virtual Sink Modal ───────────────────────────────────────────────────────
+function openVsinkModal() {
+  vsinkNameInput.value = '';
+  modalVsink.style.display = 'flex';
+  setTimeout(() => vsinkNameInput.focus(), 50);
+}
+
+function closeVsinkModal() {
+  modalVsink.style.display = 'none';
+}
+
+modalVsinkCancel.addEventListener('click', closeVsinkModal);
+modalVsink.addEventListener('click', (e) => {
+  if (e.target === modalVsink) closeVsinkModal();
+});
+
+async function doCreateVirtualSink() {
+  const raw = vsinkNameInput.value.trim();
+  const name = raw.replace(/['"\\]/g, '').replace(/\s+/g, '_');
+  if (!name) {
+    vsinkNameInput.focus();
+    return;
+  }
+
+  closeVsinkModal();
+  setStatus(`Creating virtual sink "${name}"\u2026`);
+
+  try {
+    const moduleId = await invoke('create_virtual_sink', { name });
+    const vs = { name, moduleId };
+    virtualSinks.push(vs);
+    saveVirtualSinks();
+
+    setStatus(`Created virtual sink "${name}" (module ${moduleId}) — waiting for PipeWire\u2026`);
+
+    // Wait for PipeWire to register the new ports before refreshing
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await refresh();
+  } catch (err) {
+    setStatus(`Failed to create virtual sink: ${err}`, true);
+    showErrorBanner(`Failed to create virtual sink "${name}": ${err}`);
+  }
+}
+
+modalVsinkConfirm.addEventListener('click', doCreateVirtualSink);
+vsinkNameInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter')  doCreateVirtualSink();
+  if (e.key === 'Escape') closeVsinkModal();
+});
+
+btnNewVsink.addEventListener('click', openVsinkModal);
+
+// ─── Virtual sink deletion ────────────────────────────────────────────────────
+async function doDeleteVirtualSink(vs) {
+  setStatus(`Deleting virtual sink "${vs.name}"\u2026`);
+  try {
+    await invoke('delete_virtual_sink', { moduleId: vs.moduleId });
+
+    virtualSinks = virtualSinks.filter(v => v.moduleId !== vs.moduleId);
+    saveVirtualSinks();
+
+    setStatus(`Deleted virtual sink "${vs.name}"`);
+    await refresh();
+    await saveCurrentLinks();
+  } catch (err) {
+    setStatus(`Failed to delete virtual sink: ${err}`, true);
+  }
+}
+
+// ─── Refresh ──────────────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    let nodeNamesResult;
+    [allOutputs, allInputs, links, nodeNamesResult] = await Promise.all([
+      invoke('get_outputs'),
+      invoke('get_inputs'),
+      invoke('get_links'),
+      invoke('get_node_names'),
+    ]);
+
+    // nodeNamesResult is a plain object; convert to Map
+    nodeDescriptions = new Map(Object.entries(nodeNamesResult));
+
+    renderAll();
+
+    // Cables must be drawn after DOM update
+    requestAnimationFrame(() => {
+      requestAnimationFrame(drawCables);
+    });
+
+    setStatus(`Refreshed — ${allOutputs.length} outputs, ${allInputs.length} inputs, ${links.length} links`);
+  } catch (err) {
+    setStatus(`Refresh error: ${err}`, true);
+  }
+}
+
+// ─── Auto-refresh ─────────────────────────────────────────────────────────────
+function startAutoRefresh() {
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = setInterval(refresh, 3000);
+}
+
+// ─── Global event wiring ──────────────────────────────────────────────────────
+btnRefresh.addEventListener('click', () => {
+  clearSelectedOutput();
+  refresh();
+});
+
+window.addEventListener('resize', drawCables);
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.port-dot') && !e.target.closest('.cable')) {
+    clearSelectedOutput();
+  }
+});
+
+// ESC closes any open modal; D toggles debug panel
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeVsinkModal();
+  }
+  if (e.key === 'd' || e.key === 'D') {
+    // Don't trigger when typing in an input
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (debugPanel) {
+      const isVisible = debugPanel.style.display !== 'none';
+      if (isVisible) {
+        debugPanel.style.display = 'none';
+      } else {
+        debugPanel.style.display = 'block';
+        debugPanel.textContent = 'Loading debug info\u2026';
+        invoke('get_debug_info')
+          .then(info => { debugPanel.textContent = info; })
+          .catch(err => { debugPanel.textContent = `Error: ${err}`; });
+      }
+    }
+  }
+});
+
+// Scroll in either column → redraw cables
+document.getElementById('column-outputs').addEventListener('scroll', drawCables);
+document.getElementById('column-inputs').addEventListener('scroll',  drawCables);
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+async function init() {
+  if (!window.__TAURI__?.core?.invoke) {
+    setTimeout(init, 50);
+    return;
+  }
+
+  loadVirtualSinks();
+  updateModeToggleLabel();
+
+  // Check for required system tools before first refresh
+  try {
+    const missing = await invoke('check_deps');
+    if (missing.length > 0) {
+      showErrorBanner(
+        `Missing tools: ${missing.join(', ')}. Make sure PipeWire and pipewire-pulse are installed.`
+      );
+    }
+  } catch (_) {
+    // Non-fatal: if check_deps itself fails, proceed anyway
+  }
+
+  // Attempt to restore previously saved connections
+  try {
+    const errors = await invoke('restore_connections');
+    if (errors.length > 0) {
+      showErrorBanner(
+        `Some saved connections could not be restored (device may not be available): ${errors.join('; ')}`
+      );
+    }
+  } catch (_) {
+    // Non-fatal: proceed even if restore fails
+  }
+
+  refresh();
+  startAutoRefresh();
+}
+init();

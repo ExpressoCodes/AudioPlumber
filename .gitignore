@@ -1,0 +1,26 @@
+# Rust / Cargo
+target/
+# Cargo.lock is intentionally tracked for binary apps and required by the Nix flake build
+
+# Tauri
+src-tauri/target/
+
+# Node
+node_modules/
+.tauri/
+
+# NixOS
+result
+result-*
+.direnv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
