@@ -68,18 +68,6 @@ header h1 {
   gap: 12px;
 }
 
-.status-msg {
-  font-size: 12px;
-  color: var(--text-dim);
-  font-style: italic;
-  min-width: 160px;
-  text-align: right;
-}
-
-.status-msg.error {
-  color: var(--accent);
-}
-
 .btn-refresh {
   background: var(--surface2);
   color: var(--text);

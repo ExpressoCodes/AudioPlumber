@@ -42,7 +42,6 @@ const outputsList = document.getElementById('outputs-list');
 const inputsList  = document.getElementById('inputs-list');
 const cableSvg    = document.getElementById('cable-svg');
 const btnRefresh  = document.getElementById('btn-refresh');
-const statusMsg   = document.getElementById('status-msg');
 const btnNewVsink = document.getElementById('btn-new-vsink');
 const btnModeToggle = document.getElementById('btn-mode-toggle');
 const debugPanel  = document.getElementById('debug-panel');
@@ -70,10 +69,9 @@ function hideErrorBanner() {
 
 errorBannerClose.addEventListener('click', hideErrorBanner);
 
-function setStatus(msg, isError = false) {
-  statusMsg.textContent = msg;
-  statusMsg.classList.toggle('error', isError);
-}
+// Header status display has been removed; setStatus is intentionally a no-op.
+// Call sites are preserved so selection/connect/disconnect state logic is untouched.
+function setStatus(_msg, _isError = false) {}
 
 // ─── Cable colour palette ─────────────────────────────────────────────────────
 const CABLE_COLORS = [
