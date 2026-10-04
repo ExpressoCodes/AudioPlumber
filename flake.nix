@@ -139,6 +139,9 @@
           PKG_CONFIG_PATH = with pkgs; lib.makeSearchPathOutput "dev" "lib/pkgconfig" buildDeps;
 
           postInstall = ''
+            # Provide audioplumber as an alias for audio-plumber
+            ln -s $out/bin/audio-plumber $out/bin/audioplumber
+
             # Install .desktop file and icon so the app appears in launchers
             mkdir -p $out/share/applications $out/share/icons/hicolor/128x128/apps
 

@@ -287,15 +287,17 @@ async fn get_node_names() -> HashMap<String, String> {
 
 /// Returns the path to the connections persistence file.
 fn connections_file_path() -> PathBuf {
-    let base = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.config", home)
+        });
     PathBuf::from(base)
-        .join(".local")
-        .join("share")
         .join("audioplumber")
         .join("connections.json")
 }
 
-/// Saves the full connections list to ~/.local/share/audioplumber/connections.json.
+/// Saves the full connections list to ~/.config/audioplumber/connections.json.
 #[tauri::command]
 async fn save_connections(connections: Vec<Link>) -> Result<(), String> {
     let path = connections_file_path();
