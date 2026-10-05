@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>AudioPlumber</title>
+  <defs>
+    <linearGradient id="apC3-dark" gradientUnits="userSpaceOnUse" x1="62" y1="437" x2="432" y2="87">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#1A1A2E"/>
+  <path d="M82 421V273A56 56 0 0 1 138 217H224" fill="none" stroke="url(#apC3-dark)" stroke-width="56" stroke-linecap="butt"/>
+  <path d="M271.6 256.7A62 62 0 1 1 285.1 206.5L228.8 191.4A26 26 0 0 0 215.3 241.6Z" fill="url(#apC3-dark)"/>
+  <path d="M338 161V273M390 109V325M442 149V285" stroke="url(#apC3-dark)" stroke-width="34" stroke-linecap="round"/>
+</svg>
