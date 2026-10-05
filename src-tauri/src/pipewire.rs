@@ -3,9 +3,10 @@
 //! All PipeWire/PulseAudio interaction (shelling out to `pw-link`, `pactl`,
 //! `pw-dump`), the parsing of their output, the serde data types, and the
 //! connections-persistence/auto-reconnect logic live here with **no** Tauri
-//! dependency. The Tauri layer in `main.rs` is a thin set of `#[tauri::command]`
-//! shims that call these functions. This keeps the backend reusable verbatim by
-//! the forthcoming egui/eframe frontend.
+//! dependency. The egui front-end in `app.rs` calls these functions directly
+//! from a background worker thread. Keeping the backend GUI-agnostic is what
+//! allowed the Tauri webview to be swapped out for the native egui GUI with the
+//! audited command logic reused verbatim.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

@@ -5,24 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dependencies]
-tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-
-# Legacy Tauri webview binary (removed in the final pivot step).
-[[bin]]
-name = "audio-plumber"
-path = "src/main.rs"
-
-# Native egui/eframe binary — the pivot target.
-[[bin]]
-name = "audio-plumber-egui"
-path = "src/bin/egui.rs"
 
 [profile.release]
 panic = "abort"
@@ -30,3 +16,34 @@ codegen-units = 1
 lto = "thin"
 opt-level = "s"
 strip = true
+
+# ─── Linux packaging metadata ───────────────────────────────────────────────
+# Consumed by `cargo deb` (cargo-deb) to produce a .deb. The app shells out to
+# pw-link / pactl / pw-dump at runtime, hence the PipeWire/pulse dependencies.
+[package.metadata.deb]
+name = "audioplumber"
+maintainer = "AudioPlumber"
+copyright = "AudioPlumber contributors"
+extended-description = "A visual PipeWire patchbay with a native egui GUI."
+section = "sound"
+priority = "optional"
+depends = "libc6, pipewire, pulseaudio-utils"
+assets = [
+    ["target/release/audio-plumber", "usr/bin/audio-plumber", "755"],
+    ["../packaging/audioplumber.desktop", "usr/share/applications/audioplumber.desktop", "644"],
+    ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/audioplumber.png", "644"],
+]
+
+# Consumed by `cargo generate-rpm` (cargo-generate-rpm) to produce a .rpm.
+[package.metadata.generate-rpm]
+name = "audioplumber"
+summary = "Visual PipeWire patchbay with a native egui GUI"
+# pipewire-pulse provides pactl; pipewire-utils provides pw-link / pw-dump.
+requires = { pipewire = "*", "pipewire-pulseaudio" = "*" }
+# Paths are relative to this manifest's directory (src-tauri); the release
+# workflow runs `cargo generate-rpm` from there.
+assets = [
+    { source = "target/release/audio-plumber", dest = "/usr/bin/audio-plumber", mode = "755" },
+    { source = "../packaging/audioplumber.desktop", dest = "/usr/share/applications/audioplumber.desktop", mode = "644" },
+    { source = "icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/audioplumber.png", mode = "644" },
+]
