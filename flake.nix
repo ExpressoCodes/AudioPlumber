@@ -89,8 +89,10 @@
             "${gsettings-desktop-schemas}/share/gsettings-schemas/${gsettings-desktop-schemas.name}"
           ];
 
-          # Disable Rust incremental to keep builds deterministic
-          CARGO_INCREMENTAL = "0";
+          # Leave CARGO_INCREMENTAL unset in the dev shell so `cargo tauri dev`
+          # gets fast incremental rebuilds. Determinism of the reproducible
+          # `nix build` package output is controlled separately by
+          # buildRustPackage (see packages.default below) and is unaffected.
 
           # OpenSSL config
           OPENSSL_DIR = "${pkgs.openssl.dev}";
@@ -115,6 +117,20 @@
 
           # Build only the src-tauri subdirectory
           buildAndTestSubdir = "src-tauri";
+
+          # IMPORTANT: this path builds ONLY the Rust/NixOS binary and never the
+          # Tauri bundler. buildRustPackage's build phase (cargoBuildHook) invokes
+          # plain `cargo build --release`; it does NOT run `cargo tauri build`, so
+          # no deb/rpm/AppImage bundles are ever produced here. This is guaranteed
+          # by construction — we intentionally do not use cargo-tauri in this
+          # derivation. (Regular `cargo tauri build` in the dev shell still
+          # produces all three bundle formats via tauri.conf.json's bundle.targets
+          # = "all"; that path is deliberately left untouched.)
+          #
+          # Keep incremental compilation off here so the reproducible package
+          # output stays deterministic (the dev shell drops this for fast
+          # interactive rebuilds).
+          CARGO_INCREMENTAL = "0";
 
           nativeBuildInputs = with pkgs; [
             pkg-config
