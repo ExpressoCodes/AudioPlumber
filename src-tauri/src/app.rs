@@ -63,6 +63,12 @@ const STEREO_PORT_NAMES: [&str; 4] = ["playback_FL", "playback_FR", "capture_FL"
 const DOT_SIZE: f32 = 12.0;
 const COL_WIDTH: f32 = 320.0;
 const REFRESH_SECS: u64 = 3;
+/// Fixed height of a single port row. Bounding the row height keeps node cards
+/// sized to their content (and stacked from the top) instead of stretching to
+/// fill the column — and keeps each port dot anchored on its own row.
+const ROW_H: f32 = 20.0;
+/// Width of the "New Virtual Sink" modal card (matches the old `.modal-card-sm`).
+const MODAL_W: f32 = 340.0;
 
 // ─── Backend worker protocol ───────────────────────────────────────────────
 
@@ -623,6 +629,7 @@ struct FrameOut {
     banner_dismissed: bool,
     modal_cancel: bool,
     modal_confirm: bool,
+    modal_rect: Option<Rect>,
     patchbay_clip: Option<Rect>,
     card_rects: HashMap<String, Rect>,
 }
@@ -861,6 +868,7 @@ fn render_left_column(
             .unwrap_or(false);
 
         let inner = card_frame(true).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
             card_name(ui, &vs.name, TEAL);
 
             if ports.is_empty() {
@@ -879,29 +887,37 @@ fn render_left_column(
                 let key = DotKey::OutNode(actual_node.clone());
                 let selected = app.pending.as_ref().map(|p| p.key == key).unwrap_or(false);
                 let connected = connected_out.contains(&actual_node);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    port_dot(
-                        ui, PORT_OUT, key, Side::Output, port_ids, selected, connected,
-                        &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
-                    );
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(truncate(&vs.name, 30)).color(TEXT_DIM).size(11.0));
-                });
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), ROW_H),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        ui.add_space(6.0);
+                        port_dot(
+                            ui, PORT_OUT, key, Side::Output, port_ids, selected, connected,
+                            &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
+                        );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(truncate(&vs.name, 30)).color(TEXT_DIM).size(11.0));
+                    },
+                );
             } else {
                 for p in &ports {
                     let key = DotKey::OutPort(p.id.clone());
                     let selected = app.pending.as_ref().map(|pd| pd.key == key).unwrap_or(false);
                     let connected = connected_out.contains(&p.node);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        port_dot(
-                            ui, PORT_OUT, key, Side::Output, vec![p.id.clone()], selected, connected,
-                            &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
-                        );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(truncate(&p.port, 30)).color(TEXT_DIM).size(11.0));
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), ROW_H),
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            ui.add_space(6.0);
+                            port_dot(
+                                ui, PORT_OUT, key, Side::Output, vec![p.id.clone()], selected, connected,
+                                &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(truncate(&p.port, 30)).color(TEXT_DIM).size(11.0));
+                        },
+                    );
                 }
             }
 
@@ -970,6 +986,7 @@ fn render_right_column(
             .unwrap_or_else(|| node_name.clone());
 
         card_frame(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
             card_name(ui, &display, TEXT);
 
             if app.simple_mode {
@@ -977,29 +994,37 @@ fn render_right_column(
                 let key = DotKey::InNode(node_name.clone());
                 let selected = app.pending.as_ref().map(|p| p.key == key).unwrap_or(false);
                 let connected = connected_in.contains(node_name);
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    port_dot(
-                        ui, PORT_IN, key, Side::Input, port_ids, selected, connected,
-                        &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
-                    );
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(truncate(&display, 30)).color(TEXT_DIM).size(11.0));
-                });
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), ROW_H),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.add_space(6.0);
+                        port_dot(
+                            ui, PORT_IN, key, Side::Input, port_ids, selected, connected,
+                            &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
+                        );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(truncate(&display, 30)).color(TEXT_DIM).size(11.0));
+                    },
+                );
             } else {
                 for p in ports {
                     let key = DotKey::InPort(p.id.clone());
                     let selected = app.pending.as_ref().map(|pd| pd.key == key).unwrap_or(false);
                     let connected = connected_in.contains(&p.node);
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        port_dot(
-                            ui, PORT_IN, key, Side::Input, vec![p.id.clone()], selected, connected,
-                            &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
-                        );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(truncate(&p.port, 30)).color(TEXT_DIM).size(11.0));
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(ui.available_width(), ROW_H),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.add_space(6.0);
+                            port_dot(
+                                ui, PORT_IN, key, Side::Input, vec![p.id.clone()], selected, connected,
+                                &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(truncate(&p.port, 30)).color(TEXT_DIM).size(11.0));
+                        },
+                    );
                 }
             }
         });
@@ -1052,6 +1077,12 @@ impl AudioPlumberApp {
     }
 
     fn draw_cables(&mut self, ctx: &egui::Context, out: &FrameOut) {
+        // While the modal is open, the dim backdrop covers the patchbay — don't
+        // draw cables over/under it (keeps the backdrop uniform).
+        if self.show_vsink_modal {
+            self.hovered_cable = None;
+            return;
+        }
         let painter = ctx.layer_painter(egui::LayerId::new(Order::Foreground, Id::new("cables")));
         let painter = match out.patchbay_clip {
             Some(clip) => painter.with_clip_rect(clip),
@@ -1106,31 +1137,55 @@ impl AudioPlumberApp {
     }
 
     fn draw_modal(&mut self, ctx: &egui::Context, out: &mut FrameOut) {
-        // Dim backdrop.
-        let bp = ctx.layer_painter(egui::LayerId::new(Order::Foreground, Id::new("modal_bg")));
-        bp.rect_filled(ctx.screen_rect(), Rounding::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+        // Semi-transparent dim backdrop that dims only the content BEHIND the card.
+        // Painted on the foreground layer (above the cables) first; the modal
+        // window below is forced to a higher order so the card itself is NOT dimmed.
+        let bp = ctx.layer_painter(egui::LayerId::new(Order::Foreground, Id::new("modal_backdrop")));
+        bp.rect_filled(
+            ctx.screen_rect(),
+            Rounding::ZERO,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+        );
 
-        let win = egui::Window::new(egui::RichText::new("NEW VIRTUAL SINK").color(TEXT).size(14.0).strong())
+        let inner_w = MODAL_W - 36.0; // minus the 18px inner margins on each side
+        let card = egui::Frame::none()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0_f32, SURFACE2))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::same(18.0))
+            .shadow(egui::epaint::Shadow {
+                offset: egui::vec2(0.0, 8.0),
+                blur: 32.0,
+                spread: 0.0,
+                color: Color32::from_black_alpha(140),
+            });
+
+        // A contained, centered dialog CARD with a fixed width (auto height).
+        let win = egui::Window::new("vsink_modal")
             .id(Id::new("vsink_modal"))
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .movable(false)
+            .order(Order::Tooltip) // strictly above the Foreground backdrop
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .frame(
-                egui::Frame::none()
-                    .fill(SURFACE)
-                    .stroke(Stroke::new(1.0_f32, SURFACE2))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(Margin::same(18.0)),
-            )
+            .frame(card)
             .show(ctx, |ui| {
-                ui.set_width(300.0);
+                ui.set_width(inner_w);
+
+                // Styled title header (like the old `.modal-title`).
+                ui.label(egui::RichText::new("NEW VIRTUAL SINK").color(TEXT).size(14.0).strong());
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(10.0);
+
                 ui.label(egui::RichText::new("NAME").color(TEXT_DIM).size(12.0));
                 ui.add_space(6.0);
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.vsink_input)
                         .hint_text("e.g. Recording Mix")
                         .char_limit(64) // parity with the old input's maxlength=64
-                        .desired_width(f32::INFINITY),
+                        .desired_width(inner_w), // finite: keeps the card from stretching
                 );
                 if self.vsink_focus_pending {
                     resp.request_focus();
@@ -1139,24 +1194,37 @@ impl AudioPlumberApp {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     out.modal_confirm = true;
                 }
-                ui.add_space(14.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let confirm = egui::Button::new(egui::RichText::new("Create").color(Color32::WHITE).size(13.0))
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // Cancel / Create row, right-aligned, bounded height.
+                ui.allocate_ui_with_layout(
+                    Vec2::new(inner_w, 28.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        let confirm = egui::Button::new(
+                            egui::RichText::new("Create").color(Color32::WHITE).size(13.0),
+                        )
                         .fill(ACCENT);
-                    if ui.add(confirm).clicked() {
-                        out.modal_confirm = true;
-                    }
-                    if ui
-                        .button(egui::RichText::new("Cancel").color(TEXT_DIM).size(13.0))
-                        .clicked()
-                    {
-                        out.modal_cancel = true;
-                    }
-                });
+                        if ui.add(confirm).clicked() {
+                            out.modal_confirm = true;
+                        }
+                        if ui
+                            .button(egui::RichText::new("Cancel").color(TEXT_DIM).size(13.0))
+                            .clicked()
+                        {
+                            out.modal_cancel = true;
+                        }
+                    },
+                );
             });
 
-        // ARIA role="dialog" aria-modal equivalent on the window node.
+        // Record the card rect (for click-outside-to-close) and set the
+        // ARIA role="dialog" + accessible name on the window node.
         if let Some(w) = win {
+            out.modal_rect = Some(w.response.rect);
             a11y(ctx, w.response.id, Some("New Virtual Sink"), Some(Role::Dialog), None);
         }
     }
@@ -1172,6 +1240,42 @@ impl AudioPlumberApp {
                 i.key_pressed(Key::Enter),
             )
         });
+
+        // ── Modal: handled FIRST and exclusively while open, so it is truly
+        //    modal — background buttons/clicks are ignored behind it. ──
+        if self.show_vsink_modal {
+            let outside_click = {
+                let (clicked, pos) =
+                    ctx.input(|i| (i.pointer.primary_clicked(), i.pointer.interact_pos()));
+                match (clicked, pos, out.modal_rect) {
+                    (true, Some(p), Some(r)) => !r.contains(p), // click outside the card
+                    _ => false,
+                }
+            };
+            if esc {
+                // Esc closes the modal AND cancels any pending selection (parity).
+                self.show_vsink_modal = false;
+                self.clear_selection();
+            } else if out.modal_cancel || outside_click {
+                self.show_vsink_modal = false;
+            } else if out.modal_confirm || (enter && !self.vsink_input.trim().is_empty()) {
+                let sanitized: String = self
+                    .vsink_input
+                    .trim()
+                    .chars()
+                    .filter(|c| *c != '\'' && *c != '"' && *c != '\\')
+                    .collect();
+                let name: String = collapse_whitespace(&sanitized);
+                if !name.is_empty() {
+                    self.show_vsink_modal = false;
+                    let _ = self.cmd_tx.send(Cmd::CreateSink {
+                        name,
+                        sinks: self.virtual_sinks.clone(),
+                    });
+                }
+            }
+            return;
+        }
 
         if out.banner_dismissed {
             self.error_banner = None;
@@ -1190,35 +1294,7 @@ impl AudioPlumberApp {
             self.vsink_focus_pending = true;
         }
 
-        // Modal handling.
-        if self.show_vsink_modal {
-            if esc {
-                // Esc closes the modal AND cancels any pending selection (parity).
-                self.show_vsink_modal = false;
-                self.clear_selection();
-            } else if out.modal_cancel {
-                self.show_vsink_modal = false;
-            } else if out.modal_confirm || (enter && !self.vsink_input.trim().is_empty()) {
-                let sanitized: String = self
-                    .vsink_input
-                    .trim()
-                    .chars()
-                    .filter(|c| *c != '\'' && *c != '"' && *c != '\\')
-                    .collect();
-                let name: String = collapse_whitespace(&sanitized);
-                if !name.is_empty() {
-                    self.show_vsink_modal = false;
-                    let _ = self.cmd_tx.send(Cmd::CreateSink {
-                        name,
-                        sinks: self.virtual_sinks.clone(),
-                    });
-                }
-            }
-            // While the modal is open, swallow other interactions.
-            return;
-        }
-
-        // Esc cancels any pending selection (modal already handled above).
+        // Esc cancels any pending selection (no modal open here).
         if esc {
             self.clear_selection();
         }
