@@ -8,9 +8,7 @@
 //! separation keeps the backend reusable verbatim by the forthcoming
 //! egui/eframe frontend and keeps the eventual webview removal reversible.
 
-mod pipewire;
-
-use pipewire::{Link, Port};
+use audio_plumber::pipewire::{self, Link, Port};
 use std::collections::HashMap;
 
 #[tauri::command]
