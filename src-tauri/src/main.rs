@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -323,8 +323,32 @@ async fn load_saved_connections() -> Vec<Link> {
     serde_json::from_str::<Vec<Link>>(&data).unwrap_or_default()
 }
 
+/// Collects the set of port identifiers (`Node:port`) currently present in
+/// PipeWire, across both output (-o) and input (-i) ports.
+fn current_port_ids() -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for flag in ["-o", "-i"] {
+        if let Ok(raw) = run_pw_link_query(&[flag]) {
+            for port in parse_ports(&raw) {
+                ids.insert(port.id);
+            }
+        }
+    }
+    ids
+}
+
 /// Reads saved connections and attempts to re-establish each one via pw-link.
-/// Returns a list of error strings for connections that failed.
+///
+/// This is called both at startup and on every refresh, so it doubles as the
+/// auto-reconnect mechanism: a saved connection whose device/port is absent is
+/// retried on each call and established as soon as the endpoints reappear.
+///
+/// Returns only *genuine* errors. A saved connection whose endpoint port is not
+/// currently present (the device is unplugged/disabled) is a normal, expected
+/// condition — it is skipped silently, kept in the config, and retried later.
+/// A connection that is already active ("File exists") is likewise not an error.
+/// Only a failure where *both* endpoints are present but the link still fails is
+/// surfaced to the caller.
 #[tauri::command]
 async fn restore_connections() -> Vec<String> {
     let saved = {
@@ -336,13 +360,26 @@ async fn restore_connections() -> Vec<String> {
         serde_json::from_str::<Vec<Link>>(&data).unwrap_or_default()
     };
 
+    let present = current_port_ids();
+
     let mut errors = Vec::new();
     for link in saved {
+        // Benign skip: an endpoint is not currently present (device absent).
+        // Keep the connection in the saved config and retry on a future call.
+        if !present.contains(&link.from) || !present.contains(&link.to) {
+            eprintln!(
+                "restore_connections: skipping absent endpoint {} -> {} (device not present)",
+                link.from, link.to
+            );
+            continue;
+        }
         if let Err(e) = run_pw_link_cmd(&[&link.from, &link.to]) {
-            // "File exists" means the link is already active in PipeWire — not an error
-            if !e.contains("File exists") {
-                errors.push(format!("{} -> {}: {}", link.from, link.to, e));
+            // "File exists" means the link is already active in PipeWire — not an error.
+            if e.contains("File exists") {
+                continue;
             }
+            // Both endpoints are present but the link genuinely failed — report it.
+            errors.push(format!("{} -> {}: {}", link.from, link.to, e));
         }
     }
     errors

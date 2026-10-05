@@ -786,6 +786,16 @@ async function doDeleteVirtualSink(vs) {
 // ─── Refresh ──────────────────────────────────────────────────────────────────
 async function refresh() {
   try {
+    // Auto-reconnect: opportunistically re-establish any saved connections whose
+    // devices/ports have (re)appeared since the last refresh. This reuses the
+    // existing 3s refresh poll as the live-monitoring hook — the backend skips
+    // absent endpoints silently and only re-links what is now present. Genuine
+    // link failures are surfaced at startup (see init); here they are ignored to
+    // keep periodic refreshes non-intrusive.
+    try {
+      await invoke('restore_connections');
+    } catch (_) { /* non-fatal */ }
+
     let nodeNamesResult;
     [allOutputs, allInputs, links, nodeNamesResult] = await Promise.all([
       invoke('get_outputs'),
@@ -881,12 +891,15 @@ async function init() {
     // Non-fatal: if check_deps itself fails, proceed anyway
   }
 
-  // Attempt to restore previously saved connections
+  // Attempt to restore previously saved connections. Connections whose device
+  // or port is not currently present are skipped silently by the backend and
+  // retried automatically on later refreshes, so only genuine link failures
+  // (both endpoints present, link still failed) are reported here.
   try {
     const errors = await invoke('restore_connections');
     if (errors.length > 0) {
       showErrorBanner(
-        `Some saved connections could not be restored (device may not be available): ${errors.join('; ')}`
+        `Some saved connections failed to restore: ${errors.join('; ')}`
       );
     }
   } catch (_) {
