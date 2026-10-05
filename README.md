@@ -3,8 +3,8 @@
 > Visual PipeWire patchbay — a desktop GUI for wiring up your audio graph.
 
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-informational)
-![Built with Tauri 2](https://img.shields.io/badge/built%20with-Tauri%202-24C8DB)
-![Backend: Rust](https://img.shields.io/badge/backend-Rust-dea584)
+![Built with egui](https://img.shields.io/badge/built%20with-egui-black)
+![Language: Rust](https://img.shields.io/badge/language-Rust-dea584)
 ![Audio: PipeWire](https://img.shields.io/badge/audio-PipeWire-blue)
 
 ## What is AudioPlumber?
@@ -55,15 +55,18 @@ behind your back).
 
 Under the hood it is a small, dependency-light front end over the standard
 PipeWire / PulseAudio command-line tools (`pw-link`, `pw-dump`, `pactl`): a
-[Tauri 2](https://v2.tauri.app/) shell with a Rust backend and a plain
-HTML/CSS/JavaScript UI (no bundler, no framework).
+single native binary written entirely in Rust, with a pure-Rust
+[egui](https://github.com/emilk/egui)/[eframe](https://github.com/emilk/egui/tree/master/crates/eframe)
+GUI. There is no webview and no web runtime — it draws its own window with
+OpenGL, which keeps the dependency footprint small (no GTK/WebKit).
 
 <!-- TODO: screenshot -->
 
 ## Features
 
 - **Two-column visual patchbay** — virtual sinks on the left, real audio
-  outputs (auto-discovered) on the right, with cables drawn as an SVG overlay.
+  outputs (auto-discovered) on the right, with hand-drawn glowing bezier cables
+  rendered directly with egui's painter.
 - **Click to connect, click to disconnect** — click a monitor port on a virtual
   sink, then an output port, to create a link; click a cable to remove it.
   Right-click a port to disconnect everything attached to it.
@@ -86,18 +89,37 @@ HTML/CSS/JavaScript UI (no bundler, no framework).
 AudioPlumber drives the standard PipeWire tooling, so you need a working
 PipeWire stack at runtime:
 
-- **PipeWire** — provides `pw-link` and `pw-dump`.
-- **pipewire-pulse** (PulseAudio compatibility) — provides `pactl`, used to
-  create and remove virtual sinks.
+- **PipeWire** plus its command-line tools — `pw-link` and `pw-dump`. On
+  Debian/Ubuntu these live in the **`pipewire-bin`** package; on Fedora in
+  **`pipewire-utils`**.
+- **`pactl`** — used to create and remove virtual sinks. Ships in
+  **`pulseaudio-utils`** (it works against `pipewire-pulse`).
 
 The app checks for `pw-link` and `pactl` on startup and shows a banner if they
-are not found.
+are not found. These runtime dependencies are declared by the `.deb` and `.rpm`
+packages, so installing those pulls them in automatically.
 
 ## Installation
 
-The flake input URL is `github:ExpressoCodes/AudioPlumber`.
+### Prebuilt packages (.deb / .rpm / .AppImage)
+
+Each tagged release publishes three Linux bundles on the GitHub Releases page:
+
+- **`.deb`** (Debian/Ubuntu) — `sudo apt install ./audioplumber*.deb`. Declares
+  its runtime dependencies (`pipewire`, `pipewire-bin`, `pulseaudio-utils`), so
+  they are pulled in automatically.
+- **`.rpm`** (Fedora/openSUSE) — `sudo dnf install ./audioplumber*.rpm`. Requires
+  `pipewire`, `pipewire-utils` and `pulseaudio-utils`.
+- **`.AppImage`** — `chmod +x audioplumber*.AppImage && ./audioplumber*.AppImage`.
+  The AppImage bundles the OpenGL/Wayland/X11 **client** libraries it needs, so
+  it runs on most distros without extra packages. It still relies on the host's
+  GPU/GL **driver** (the Mesa DRI module), which is hardware-specific and comes
+  with any normal desktop install. You still need the PipeWire tools
+  (`pw-link`/`pactl`) present at runtime.
 
 ### NixOS (flake module)
+
+The flake input URL is `github:ExpressoCodes/AudioPlumber`.
 
 Add AudioPlumber as a flake input and import its NixOS module. The module is
 **enabled by default**, so importing it is all you need to install the app:
@@ -155,8 +177,8 @@ nix build        # result -> ./result/bin/audio-plumber
 
 ## Building from source / development
 
-The flake ships a dev shell with the full toolchain (a Tauri 2 Rust toolchain,
-`cargo-tauri`, and all the GTK/WebKit/PipeWire system libraries):
+The flake ships a dev shell with the Rust toolchain and the OpenGL/Wayland/X11
+system libraries the egui GUI links against:
 
 ```sh
 nix develop
@@ -165,42 +187,59 @@ nix develop
 Inside the shell:
 
 ```sh
-cargo tauri dev      # run the app with a live dev window
-cargo tauri build    # produce a production build
-cargo test           # run the Rust unit tests
+cargo run                 # build and run the app
+cargo build --release     # produce an optimised build
+cargo test                # run the Rust unit tests
 ```
 
-The frontend (in `ui/`) is plain static `index.html` / `style.css` / `main.js`
-with `withGlobalTauri` enabled — there is no JavaScript build step or package
-manager to install.
+The optimised binary is written to `src-tauri/target/release/audio-plumber`.
+There is no JavaScript, npm, or webview build step — the whole app is Rust.
 
 ### Project layout
 
 ```
 .
-├── flake.nix              # dev shell, package, nix run app, NixOS module
-├── ui/                    # static front end (HTML/CSS/JS)
-│   ├── index.html
-│   ├── main.js
-│   └── style.css
-└── src-tauri/             # Rust / Tauri backend
-    ├── Cargo.toml
-    ├── src/main.rs        # Tauri commands wrapping pw-link / pw-dump / pactl
-    ├── tauri.conf.json
-    └── icons/
+├── flake.nix                  # dev shell, package, `nix run` app, NixOS module
+├── LICENSE
+├── packaging/
+│   └── audioplumber.desktop   # desktop entry installed by the packages
+└── src-tauri/                 # Rust crate (directory name kept from the Tauri era)
+    ├── Cargo.toml             # crate manifest + .deb / .rpm packaging metadata
+    ├── icons/
+    └── src/
+        ├── main.rs            # eframe entry point
+        ├── app.rs             # native egui/eframe patchbay UI
+        ├── pipewire.rs        # GUI-free backend over pw-link / pw-dump / pactl
+        └── lib.rs             # library crate exposing `pipewire` + `app`
 ```
 
 ### Toolchain (for non-Nix builds)
 
-If you are building outside the Nix dev shell, you will need roughly what the
-flake provides:
+If you are building outside the Nix dev shell you will need:
 
-- Rust (stable, 1.77+ for Tauri 2)
-- `cargo-tauri` (Tauri CLI v2)
-- GTK 3, WebKitGTK 4.1, libsoup 3, and the usual Tauri Linux system libraries
-  (`glib`, `cairo`, `pango`, `gdk-pixbuf`, `atk`, `dbus`, `openssl`, `librsvg`,
-  `libayatana-appindicator`, `xdotool`), plus `pkg-config` and
-  `gobject-introspection`.
+- A stable **Rust** toolchain and `pkg-config`.
+- The OpenGL/windowing development libraries. On **Debian/Ubuntu** (matching what
+  CI installs):
+
+  ```sh
+  sudo apt install \
+    libgl1-mesa-dev libegl1-mesa-dev libgbm-dev \
+    libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+    libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+    pkg-config build-essential
+  ```
+
+  On **Nix**, the flake declares the equivalents (`libGL`, `libxkbcommon`,
+  `wayland`, `libx11`, `libxcursor`, `libxrandr`, `libxi`).
+
+Build with `cargo build --release` from the `src-tauri/` directory (or pass
+`--manifest-path src-tauri/Cargo.toml`).
+
+### Packaging
+
+Tagged releases build the `.deb`, `.rpm` and `.AppImage` bundles in CI
+(`.github/workflows/release.yml`) with `cargo-deb`, `cargo-generate-rpm` and
+`linuxdeploy`; the deb/rpm metadata lives in `src-tauri/Cargo.toml`.
 
 ## Configuration
 
