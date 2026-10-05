@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Port {
@@ -323,6 +324,13 @@ async fn load_saved_connections() -> Vec<Link> {
     serde_json::from_str::<Vec<Link>>(&data).unwrap_or_default()
 }
 
+/// Process-global set of absent saved endpoints already logged, so the benign
+/// "device not present" skip is reported once rather than on every refresh poll.
+fn logged_absent_endpoints() -> &'static Mutex<HashSet<String>> {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 /// Collects the set of port identifiers (`Node:port`) currently present in
 /// PipeWire, across both output (-o) and input (-i) ports.
 fn current_port_ids() -> HashSet<String> {
@@ -367,10 +375,17 @@ async fn restore_connections() -> Vec<String> {
         // Benign skip: an endpoint is not currently present (device absent).
         // Keep the connection in the saved config and retry on a future call.
         if !present.contains(&link.from) || !present.contains(&link.to) {
-            eprintln!(
-                "restore_connections: skipping absent endpoint {} -> {} (device not present)",
-                link.from, link.to
-            );
+            // restore_connections runs on every refresh poll, so log each absent
+            // endpoint at most once per process instead of spamming every cycle.
+            let key = format!("{} -> {}", link.from, link.to);
+            if let Ok(mut seen) = logged_absent_endpoints().lock() {
+                if seen.insert(key.clone()) {
+                    eprintln!(
+                        "restore_connections: skipping absent endpoint {} (device not present; will retry when it appears)",
+                        key
+                    );
+                }
+            }
             continue;
         }
         if let Err(e) = run_pw_link_cmd(&[&link.from, &link.to]) {

@@ -42,6 +42,52 @@ function saveVirtualSinks() {
   localStorage.setItem(VIRTUAL_SINKS_KEY, JSON.stringify(virtualSinks));
 }
 
+// Does a virtual sink's PipeWire null-sink currently exist? We match the node
+// name the same (fuzzy) way renderLeftColumn does, since PipeWire may append a
+// suffix like `.2` / `_1` to the requested sink_name.
+function virtualSinkPortsPresent(name, outputs) {
+  const node = `AudioPlumber_${name}`;
+  return outputs.some(p =>
+    p.node === node || p.node.startsWith(node + '.') || p.node.startsWith(node + '_')
+  );
+}
+
+// Virtual-sink *definitions* persist in localStorage, but their underlying
+// PipeWire null-sink modules do NOT survive a logout / reboot / PipeWire
+// restart — the stored moduleId becomes stale and the monitor ports vanish.
+// Without those ports the sink card is stuck on "Waiting for PipeWire…" and its
+// saved connections can never be restored. So on startup we recreate any
+// persisted sink whose ports are not currently present, and refresh its
+// moduleId. (Sinks whose ports already exist are left untouched.)
+async function ensureVirtualSinks() {
+  if (virtualSinks.length === 0) return;
+
+  let outputs;
+  try {
+    outputs = await invoke('get_outputs');
+  } catch (_) {
+    return;  // if discovery fails, skip recreation rather than risk duplicates
+  }
+
+  let changed = false;
+  for (const vs of virtualSinks) {
+    if (virtualSinkPortsPresent(vs.name, outputs)) continue;
+    try {
+      vs.moduleId = await invoke('create_virtual_sink', { name: vs.name });
+      changed = true;
+    } catch (err) {
+      console.warn(`Failed to recreate virtual sink "${vs.name}":`, err);
+    }
+  }
+
+  if (changed) {
+    saveVirtualSinks();
+    // Give PipeWire a moment to register the recreated sinks' ports before the
+    // first refresh/reconnect runs.
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}
+
 // ─── DOM helpers ──────────────────────────────────────────────────────────────
 const outputsList = document.getElementById('outputs-list');
 const inputsList  = document.getElementById('inputs-list');
@@ -913,6 +959,11 @@ async function init() {
   } catch (_) {
     // Non-fatal: if check_deps itself fails, proceed anyway
   }
+
+  // Recreate any persisted virtual sinks whose PipeWire modules did not survive
+  // the last session, so their ports exist before we restore connections and
+  // render — otherwise the sink cards stay stuck on "Waiting for PipeWire…".
+  await ensureVirtualSinks();
 
   // Attempt to restore previously saved connections. Connections whose device
   // or port is not currently present are skipped silently by the backend and
