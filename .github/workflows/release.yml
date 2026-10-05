@@ -36,7 +36,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libgbm-dev \
             libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             libwayland-dev \
             libx11-dev \
             libxcursor-dev \
@@ -67,6 +70,7 @@ jobs:
 
       - name: Build .AppImage
         run: |
+          set -euxo pipefail
           # Lay out an AppDir from the compiled binary + desktop file + icon.
           mkdir -p AppDir/usr/bin
           cp src-tauri/target/release/audio-plumber AppDir/usr/bin/
@@ -75,11 +79,41 @@ jobs:
           install -Dm644 src-tauri/icons/128x128.png \
             AppDir/usr/share/icons/hicolor/128x128/apps/audioplumber.png
 
+          # The egui/eframe binary dlopens its OpenGL/Wayland/X11 CLIENT libraries
+          # at runtime (via glutin/glow and x11-dl/wayland-client), so `ldd` of the
+          # binary can't see them and linuxdeploy won't bundle them automatically.
+          # Pass them explicitly with --library so the AppImage is self-contained.
+          #
+          # NOTE: the GL *driver* itself (the Mesa DRI module, e.g. iris_dri.so /
+          # swrast_dri.so, plus libvulkan ICDs) is hardware- and host-specific and
+          # is intentionally left to the host system — bundling a working driver
+          # for every GPU is impractical. We bundle the client/loader libs so the
+          # app loads against the host's GL driver through the standard libGL/EGL
+          # dispatch, which is the normal AppImage approach for GL apps.
+          LIB_ARGS=()
+          for so in \
+            libGL.so.1 libEGL.so.1 libGLX.so.0 libGLdispatch.so.0 libOpenGL.so.0 \
+            libgbm.so.1 \
+            libwayland-client.so.0 libwayland-egl.so.1 libwayland-cursor.so.0 \
+            libxkbcommon.so.0 libxkbcommon-x11.so.0 \
+            libX11.so.6 libX11-xcb.so.1 libxcb.so.1 libXcursor.so.1 libXrandr.so.2 \
+            libXi.so.6 libXext.so.6 libXrender.so.1 libXfixes.so.3 \
+            libXau.so.6 libXdmcp.so.6 ; do
+            p="$(find /usr/lib /lib -name "$so" 2>/dev/null | head -1 || true)"
+            if [ -n "$p" ]; then LIB_ARGS+=(--library "$p"); else echo "WARN: $so not found"; fi
+          done
+
           wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy-x86_64.AppImage
-          ./linuxdeploy-x86_64.AppImage --appdir AppDir --output appimage \
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
+            --executable AppDir/usr/bin/audio-plumber \
             --desktop-file AppDir/usr/share/applications/audioplumber.desktop \
-            --icon-file AppDir/usr/share/icons/hicolor/128x128/apps/audioplumber.png
+            --icon-file AppDir/usr/share/icons/hicolor/128x128/apps/audioplumber.png \
+            "${LIB_ARGS[@]}" \
+            --output appimage
+
+          echo "=== libraries bundled into AppDir/usr/lib ==="
+          ls -1 AppDir/usr/lib || true
           mv AudioPlumber*.AppImage audioplumber.AppImage || mv ./*.AppImage audioplumber.AppImage
 
       - name: Publish GitHub Release

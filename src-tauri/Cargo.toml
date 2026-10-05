@@ -2,6 +2,7 @@
 name = "audio-plumber"
 version = "0.1.0"
 edition = "2021"
+authors = ["ExpressoCodes"]
 description = "AudioPlumber — a visual PipeWire patchbay with a native egui GUI"
 license = "MIT"
 
@@ -24,8 +25,8 @@ strip = true
 # pw-link / pactl / pw-dump at runtime, hence the PipeWire/pulse dependencies.
 [package.metadata.deb]
 name = "audioplumber"
-maintainer = "AudioPlumber"
-copyright = "AudioPlumber contributors"
+maintainer = "ExpressoCodes"
+copyright = "Copyright (c) 2026 ExpressoCodes"
 extended-description = "A visual PipeWire patchbay with a native egui GUI."
 section = "sound"
 priority = "optional"
