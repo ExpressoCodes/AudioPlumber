@@ -2,13 +2,20 @@
 name = "audio-plumber"
 version = "0.1.0"
 edition = "2021"
+description = "AudioPlumber — a visual PipeWire patchbay with a native egui GUI"
+# REQUIRED by `cargo generate-rpm`: the rpm release step fails without a
+# `license`. No license is declared anywhere in this repo, so the real SPDX
+# identifier must be supplied by the project owner, e.g.:
+#   license = "MIT"
+# Uncomment and set the correct value to unblock the .rpm build.
+# license = "<SET-ME>"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.28", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 
 [profile.release]
 panic = "abort"
@@ -27,7 +34,9 @@ copyright = "AudioPlumber contributors"
 extended-description = "A visual PipeWire patchbay with a native egui GUI."
 section = "sound"
 priority = "optional"
-depends = "libc6, pipewire, pulseaudio-utils"
+# pipewire = the daemon; pipewire-bin = pw-link / pw-dump CLI tools;
+# pulseaudio-utils = pactl (works against pipewire-pulse).
+depends = "libc6, pipewire, pipewire-bin, pulseaudio-utils"
 assets = [
     ["target/release/audio-plumber", "usr/bin/audio-plumber", "755"],
     ["../packaging/audioplumber.desktop", "usr/share/applications/audioplumber.desktop", "644"],
@@ -38,8 +47,10 @@ assets = [
 [package.metadata.generate-rpm]
 name = "audioplumber"
 summary = "Visual PipeWire patchbay with a native egui GUI"
-# pipewire-pulse provides pactl; pipewire-utils provides pw-link / pw-dump.
-requires = { pipewire = "*", "pipewire-pulseaudio" = "*" }
+# On Fedora: pipewire-utils provides pw-link / pw-dump; pulseaudio-utils
+# provides pactl. (pipewire-pulseaudio only supplies the PA replacement
+# daemon, NOT the pactl client, so it must not be relied on here.)
+requires = { pipewire = "*", "pipewire-utils" = "*", "pulseaudio-utils" = "*" }
 # Paths are relative to this manifest's directory (src-tauri); the release
 # workflow runs `cargo generate-rpm` from there.
 assets = [
