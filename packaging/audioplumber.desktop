@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=AudioPlumber
+Comment=Visual PipeWire audio patchbay
+Exec=audio-plumber
+Icon=audioplumber
+Type=Application
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;pipewire;patchbay;routing;virtual;sink;
+StartupNotify=true
