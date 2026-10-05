@@ -15,6 +15,7 @@
 //! startup restore errors) are reproduced.
 
 use eframe::egui;
+use egui::accesskit::{Live, Role};
 use egui::{
     Align, Align2, Color32, Id, Key, Layout, Margin, Order, Pos2, Rect, Rounding, Sense, Shape,
     Stroke, Vec2,
@@ -455,6 +456,29 @@ impl AudioPlumberApp {
     }
 }
 
+// ─── Accessibility ─────────────────────────────────────────────────────────
+/// Augment a widget's AccessKit node (ARIA-equivalent): optional accessible
+/// name, role and live-region politeness. No-op when AccessKit is disabled.
+fn a11y(
+    ctx: &egui::Context,
+    id: Id,
+    name: Option<&str>,
+    role: Option<Role>,
+    live: Option<Live>,
+) {
+    ctx.accesskit_node_builder(id, |b| {
+        if let Some(n) = name {
+            b.set_name(n.to_string());
+        }
+        if let Some(r) = role {
+            b.set_role(r);
+        }
+        if let Some(l) = live {
+            b.set_live(l);
+        }
+    });
+}
+
 // ─── Theme ─────────────────────────────────────────────────────────────────
 fn apply_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
@@ -631,18 +655,19 @@ impl eframe::App for AudioPlumberApp {
                                 .size(12.0),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button(egui::RichText::new("Refresh").size(13.0)).clicked() {
+                            let r = ui.button(egui::RichText::new("Refresh").size(13.0));
+                            a11y(ui.ctx(), r.id, Some("Refresh port list"), None, None);
+                            if r.clicked() {
                                 out.refresh_clicked = true;
                             }
-                            let mode_label = if this.simple_mode {
-                                "\u{2699} Advanced"
+                            let (mode_label, mode_name) = if this.simple_mode {
+                                ("\u{2699} Advanced", "Switch to advanced mode (individual ports)")
                             } else {
-                                "\u{25ce} Simple"
+                                ("\u{25ce} Simple", "Switch to simple mode (bundled stereo)")
                             };
-                            if ui
-                                .button(egui::RichText::new(mode_label).color(TEAL).size(13.0))
-                                .clicked()
-                            {
+                            let r = ui.button(egui::RichText::new(mode_label).color(TEAL).size(13.0));
+                            a11y(ui.ctx(), r.id, Some(mode_name), None, None);
+                            if r.clicked() {
                                 out.mode_clicked = true;
                             }
                         });
@@ -659,12 +684,13 @@ impl eframe::App for AudioPlumberApp {
                     )
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(msg).color(BANNER_TEXT).size(13.0));
+                            // ARIA role="alert" aria-live="assertive" equivalent.
+                            let lbl = ui.label(egui::RichText::new(msg).color(BANNER_TEXT).size(13.0));
+                            a11y(ui.ctx(), lbl.id, Some(msg), Some(Role::Alert), Some(Live::Assertive));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .button(egui::RichText::new("\u{00d7}").color(BANNER_TEXT))
-                                    .clicked()
-                                {
+                                let r = ui.button(egui::RichText::new("\u{00d7}").color(BANNER_TEXT));
+                                a11y(ui.ctx(), r.id, Some("Dismiss error"), None, None);
+                                if r.clicked() {
                                     out.banner_dismissed = true;
                                 }
                             });
@@ -769,10 +795,9 @@ fn column_header(ui: &mut egui::Ui, title: &str, action: Option<&str>, action_cl
         if let Some(label) = action {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(12.0);
-                if ui
-                    .button(egui::RichText::new(label).color(TEAL).size(11.0))
-                    .clicked()
-                {
+                let r = ui.button(egui::RichText::new(label).color(TEAL).size(11.0));
+                a11y(ui.ctx(), r.id, Some("New virtual sink"), None, None);
+                if r.clicked() {
                     *action_clicked = true;
                 }
             });
@@ -890,7 +915,9 @@ fn render_left_column(
                     )
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x5a, 0x1a, 0x1a)));
-                    if ui.add(btn).clicked() {
+                    let r = ui.add(btn);
+                    a11y(ui.ctx(), r.id, Some(&format!("Delete virtual sink {}", vs.name)), None, None);
+                    if r.clicked() {
                         out.delete_sink = Some(vs.module_id);
                     }
                 } else {
@@ -1035,17 +1062,17 @@ impl AudioPlumberApp {
         let cables = self.build_cables(&out.anchors);
 
         // Determine hovered cable (closest within threshold) for highlight/click.
+        // Not gated on the pending state: clicking a cable while a selection is
+        // pending disconnects that cable (matches the old webview behaviour).
         let mut hovered_idx: Option<usize> = None;
-        if self.pending.is_none() {
-            if let Some(p) = pointer {
-                let mut best = 7.0f32;
-                for (i, (from, to, _, _)) in cables.iter().enumerate() {
-                    let pts = sample_cable(*from, *to);
-                    let d = dist_to_polyline(&pts, p);
-                    if d < best {
-                        best = d;
-                        hovered_idx = Some(i);
-                    }
+        if let Some(p) = pointer {
+            let mut best = 7.0f32;
+            for (i, (from, to, _, _)) in cables.iter().enumerate() {
+                let pts = sample_cable(*from, *to);
+                let d = dist_to_polyline(&pts, p);
+                if d < best {
+                    best = d;
+                    hovered_idx = Some(i);
                 }
             }
         }
@@ -1083,7 +1110,7 @@ impl AudioPlumberApp {
         let bp = ctx.layer_painter(egui::LayerId::new(Order::Foreground, Id::new("modal_bg")));
         bp.rect_filled(ctx.screen_rect(), Rounding::ZERO, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
 
-        egui::Window::new(egui::RichText::new("NEW VIRTUAL SINK").color(TEXT).size(14.0).strong())
+        let win = egui::Window::new(egui::RichText::new("NEW VIRTUAL SINK").color(TEXT).size(14.0).strong())
             .id(Id::new("vsink_modal"))
             .collapsible(false)
             .resizable(false)
@@ -1102,6 +1129,7 @@ impl AudioPlumberApp {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.vsink_input)
                         .hint_text("e.g. Recording Mix")
+                        .char_limit(64) // parity with the old input's maxlength=64
                         .desired_width(f32::INFINITY),
                 );
                 if self.vsink_focus_pending {
@@ -1126,6 +1154,11 @@ impl AudioPlumberApp {
                     }
                 });
             });
+
+        // ARIA role="dialog" aria-modal equivalent on the window node.
+        if let Some(w) = win {
+            a11y(ctx, w.response.id, Some("New Virtual Sink"), Some(Role::Dialog), None);
+        }
     }
 
     fn apply_frame(&mut self, ctx: &egui::Context, out: FrameOut) {
@@ -1159,7 +1192,11 @@ impl AudioPlumberApp {
 
         // Modal handling.
         if self.show_vsink_modal {
-            if out.modal_cancel || esc {
+            if esc {
+                // Esc closes the modal AND cancels any pending selection (parity).
+                self.show_vsink_modal = false;
+                self.clear_selection();
+            } else if out.modal_cancel {
                 self.show_vsink_modal = false;
             } else if out.modal_confirm || (enter && !self.vsink_input.trim().is_empty()) {
                 let sanitized: String = self
