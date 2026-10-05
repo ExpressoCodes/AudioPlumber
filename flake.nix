@@ -1,6 +1,16 @@
 {
   description = "AudioPlumber — Visual PipeWire Patchbay (Tauri 2 + Rust)";
 
+  # Lets flake consumers pull prebuilt binaries from our GitHub Pages binary
+  # cache instead of recompiling the 417-crate tree from source. The cache is
+  # populated by the nix-cache CI workflow on every push to main / v* tag.
+  # Consumers who are not trusted users will be prompted to accept this
+  # substituter + key the first time (trusted users / root get it silently).
+  nixConfig = {
+    extraSubstituters = [ "https://expressocodes.github.io/AudioPlumber" ];
+    extraTrustedPublicKeys = [ "audioplumber-1:qqVyHW95S+ijbXZK8rXDGMMYtq9uhvyQaIbCrCmLsNc=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
@@ -30,6 +40,7 @@
           gobject-introspection
           cargo-tauri   # tauri-cli v2 from nixpkgs
           nodejs_22     # includes npm
+          sccache       # compilation cache (dev shell only — see RUSTC_WRAPPER below)
         ];
 
         buildDeps = with pkgs; [
@@ -94,6 +105,15 @@
           # `nix build` package output is controlled separately by
           # buildRustPackage (see packages.default below) and is unaffected.
 
+          # Cache compiled crates across clean builds / branch switches. The
+          # GTK/WebKit crate tree (webkit2gtk, tao, gdkx11, ...) is identical
+          # across builds and dominates compile time, so sccache gives a big
+          # win on clean rebuilds. This is DEV-SHELL-ONLY and deliberately NOT
+          # set on packages.default: the pure `nix build` sandbox has no cache
+          # dir / network, where sccache can break or non-determinize the
+          # reproducible output. Keep it here only.
+          RUSTC_WRAPPER = "sccache";
+
           # OpenSSL config
           OPENSSL_DIR = "${pkgs.openssl.dev}";
           OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
@@ -117,6 +137,10 @@
 
           # Build only the src-tauri subdirectory
           buildAndTestSubdir = "src-tauri";
+
+          # Skip the check phase: unit tests run in CI, not in the install build
+          # — avoids a full second compile of the 417-crate tree.
+          doCheck = false;
 
           # IMPORTANT: this path builds ONLY the Rust/NixOS binary and never the
           # Tauri bundler. buildRustPackage's build phase (cargoBuildHook) invokes

@@ -1,0 +1,83 @@
+name: Nix binary cache
+
+# Build the exact `nix build .#packages.x86_64-linux.default` output that NixOS
+# users consume, sign its closure with the project key, and publish a flat Nix
+# binary cache to GitHub Pages. End users then download prebuilt binaries
+# instead of recompiling the 417-crate tree from source.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Needed for the modern GitHub Pages deployment flow (OIDC + Pages write).
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two cache publishes at once / cancel superseded in-flight deploys.
+concurrency:
+  group: nix-cache-pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix (flakes enabled)
+        uses: DeterminateSystems/nix-installer-action@v16
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+
+      - name: Build the installable package
+        run: nix build .#packages.x86_64-linux.default --print-build-logs
+
+      - name: Write signing key to a runner-local keyfile
+        env:
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$NIX_SIGNING_KEY" > "$RUNNER_TEMP/nix-signing.key"
+
+      - name: Sign the result and its full closure
+        run: |
+          nix store sign \
+            --key-file "$RUNNER_TEMP/nix-signing.key" \
+            --recursive ./result
+
+      - name: Remove the signing key from the runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/nix-signing.key"
+
+      - name: Export the closure into a flat binary cache
+        run: |
+          # Flat <hash>.narinfo + <hash>.nar.zst layout with nix-cache-info at
+          # the root. nix copy only writes paths not already on the target, and
+          # the closure's cache.nixos.org-provided deps are what consumers fetch
+          # straight from upstream — only our own derivation's paths ship here.
+          nix copy --to "file://$PWD/cache?compression=zstd" ./result
+          # GitHub Pages must not reject the dot-prefixed Nix metadata file.
+          touch cache/.nojekyll
+          ls -la cache | head -n 20
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the cache as a Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: cache
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
