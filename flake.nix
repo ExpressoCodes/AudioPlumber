@@ -63,6 +63,16 @@
           # Other system libs Tauri links against
           librsvg
           libayatana-appindicator
+
+          # Graphics stack for the native egui/eframe binary (glow/winit):
+          # OpenGL loader + X11/Wayland + keyboard handling.
+          libGL
+          libxkbcommon
+          wayland
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXrandr
+          xorg.libXi
         ];
 
       in

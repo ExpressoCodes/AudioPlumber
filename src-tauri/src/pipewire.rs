@@ -409,6 +409,155 @@ pub fn get_debug_info() -> String {
     )
 }
 
+// ─── Virtual-sink persistence ──────────────────────────────────────────────
+//
+// The legacy Tauri webview stored the list of user-created virtual sinks in the
+// browser's `localStorage` under the key `audioplumber_virtual_sinks`. A native
+// binary cannot read webkit's storage, so the egui front-end persists this list
+// to a plain file alongside the existing connections store, in the same
+// `~/.config/audioplumber/` config area.
+
+/// A user-created virtual sink definition. `module_id` is the PulseAudio/PipeWire
+/// null-sink module id returned by `create_virtual_sink`; it becomes stale across
+/// a PipeWire restart and is refreshed by the startup "recreate missing sinks"
+/// flow.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VirtualSink {
+    pub name: String,
+    #[serde(rename = "moduleId", alias = "module_id")]
+    pub module_id: u32,
+}
+
+/// Path to the virtual-sinks persistence file (sibling of `connections.json`).
+fn virtual_sinks_file_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}/.config", home)
+    });
+    PathBuf::from(base)
+        .join("audioplumber")
+        .join("virtual_sinks.json")
+}
+
+/// Saves the virtual-sink definitions to `~/.config/audioplumber/virtual_sinks.json`.
+pub fn save_virtual_sinks(sinks: &[VirtualSink]) -> Result<(), String> {
+    let path = virtual_sinks_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+    }
+    let json = serde_json::to_string_pretty(sinks)
+        .map_err(|e| format!("Failed to serialize virtual sinks: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Loads virtual-sink definitions. If the native store does not yet exist, makes
+/// a best-effort attempt to import the legacy webkit `localStorage` list once,
+/// writing the result to the native store so the import happens at most once.
+/// Any failure falls back to an empty list (users re-create their sinks once).
+pub fn load_virtual_sinks() -> Vec<VirtualSink> {
+    let path = virtual_sinks_file_path();
+    if let Ok(data) = fs::read_to_string(&path) {
+        return serde_json::from_str::<Vec<VirtualSink>>(&data).unwrap_or_default();
+    }
+
+    // Native store absent → one-shot best-effort migration from the webview.
+    let imported = migrate_virtual_sinks_from_webview();
+    if !imported.is_empty() {
+        let _ = save_virtual_sinks(&imported);
+    }
+    imported
+}
+
+/// Best-effort, dependency-free import of the legacy webkit `localStorage` value
+/// for `audioplumber_virtual_sinks`.
+///
+/// WebKitGTK stores localStorage in a SQLite database inside the app's data dir.
+/// We cannot robustly parse that binary format without pulling in a SQLite
+/// dependency, so we scan the candidate database files as raw bytes for the JSON
+/// array that followed the known key. This recovers the value in the common case
+/// where it is stored as inline UTF-8 text, and silently gives up otherwise. It
+/// never blocks, never panics, and never errors out to the caller.
+fn migrate_virtual_sinks_from_webview() -> Vec<VirtualSink> {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    let data_home =
+        std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home));
+
+    // Known/likely webkit localStorage locations for the Tauri app identifier.
+    let candidates = [
+        format!("{}/com.audioplumber.app", data_home),
+        format!("{}/AudioPlumber", data_home),
+        format!("{}/.cache/com.audioplumber.app", home),
+    ];
+
+    for root in candidates {
+        let root = PathBuf::from(&root);
+        if !root.exists() {
+            continue;
+        }
+        if let Some(found) = scan_dir_for_sinks(&root, 0) {
+            return found;
+        }
+    }
+    Vec::new()
+}
+
+/// Recursively scan (bounded depth) a directory for a file whose bytes contain
+/// the legacy localStorage key followed by a parseable JSON array.
+fn scan_dir_for_sinks(dir: &std::path::Path, depth: usize) -> Option<Vec<VirtualSink>> {
+    if depth > 4 {
+        return None;
+    }
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = scan_dir_for_sinks(&path, depth + 1) {
+                return Some(found);
+            }
+        } else if let Ok(bytes) = fs::read(&path) {
+            if let Some(found) = extract_sinks_from_bytes(&bytes) {
+                if !found.is_empty() {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find the legacy key in a byte blob and parse the JSON array that follows it.
+fn extract_sinks_from_bytes(bytes: &[u8]) -> Option<Vec<VirtualSink>> {
+    let text = String::from_utf8_lossy(bytes);
+    let key = "audioplumber_virtual_sinks";
+    let key_at = text.find(key)?;
+    // Find the first '[' after the key and scan to its matching ']'.
+    let after = &text[key_at + key.len()..];
+    let start = after.find('[')?;
+    let slice = &after[start..];
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, ch) in slice.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let json = &slice[..end?];
+    serde_json::from_str::<Vec<VirtualSink>>(json).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +618,31 @@ mod tests {
     fn test_normalize_port_id() {
         assert_eq!(normalize_port_id("  Firefox:output_FL  "), "Firefox:output_FL");
         assert_eq!(normalize_port_id("NodeA:port"), "NodeA:port");
+    }
+
+    #[test]
+    fn test_virtual_sink_serde_legacy_key() {
+        // The legacy webview wrote `moduleId`; the native store also accepts
+        // `module_id`. Both must deserialize.
+        let legacy = r#"[{"name":"Mix","moduleId":42}]"#;
+        let sinks: Vec<VirtualSink> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].name, "Mix");
+        assert_eq!(sinks[0].module_id, 42);
+    }
+
+    #[test]
+    fn test_extract_sinks_from_bytes() {
+        // Simulate a webkit localStorage blob with surrounding binary noise.
+        let blob = b"\x00\x01audioplumber_virtual_sinks\x00[{\"name\":\"Rec\",\"moduleId\":7}]\x00trailing";
+        let sinks = extract_sinks_from_bytes(blob).expect("should extract");
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].name, "Rec");
+        assert_eq!(sinks[0].module_id, 7);
+    }
+
+    #[test]
+    fn test_extract_sinks_absent_key() {
+        assert!(extract_sinks_from_bytes(b"no relevant data here").is_none());
     }
 }
