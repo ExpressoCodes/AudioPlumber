@@ -783,19 +783,36 @@ async function doDeleteVirtualSink(vs) {
   }
 }
 
+// ─── Auto-reconnect ───────────────────────────────────────────────────────────
+// Re-establishes saved connections whose devices/ports are present. The backend
+// skips absent endpoints silently and only re-links what currently exists, so
+// calling this on every refresh lets a saved link reconnect automatically when
+// its device reappears.
+//
+// It is deliberately decoupled from the UI-populate path (see refresh): it is
+// fire-and-forget and must NEVER block, delay, or abort rendering. A single
+// in-flight guard stops slow restores from piling up across the 3s poll.
+let restoreInFlight = false;
+async function reconnectSavedConnections({ surfaceErrors = false } = {}) {
+  if (restoreInFlight) return;
+  restoreInFlight = true;
+  try {
+    const errors = await invoke('restore_connections');
+    // Only genuine failures (both endpoints present, link still failed) come
+    // back here; absent-device cases are skipped quietly by the backend.
+    if (surfaceErrors && Array.isArray(errors) && errors.length > 0) {
+      showErrorBanner(`Some saved connections failed to restore: ${errors.join('; ')}`);
+    }
+  } catch (_) {
+    // Non-fatal: a restore failure must never affect the UI.
+  } finally {
+    restoreInFlight = false;
+  }
+}
+
 // ─── Refresh ──────────────────────────────────────────────────────────────────
 async function refresh() {
   try {
-    // Auto-reconnect: opportunistically re-establish any saved connections whose
-    // devices/ports have (re)appeared since the last refresh. This reuses the
-    // existing 3s refresh poll as the live-monitoring hook — the backend skips
-    // absent endpoints silently and only re-links what is now present. Genuine
-    // link failures are surfaced at startup (see init); here they are ignored to
-    // keep periodic refreshes non-intrusive.
-    try {
-      await invoke('restore_connections');
-    } catch (_) { /* non-fatal */ }
-
     let nodeNamesResult;
     [allOutputs, allInputs, links, nodeNamesResult] = await Promise.all([
       invoke('get_outputs'),
@@ -818,6 +835,12 @@ async function refresh() {
   } catch (err) {
     setStatus(`Refresh error: ${err}`, true);
   }
+
+  // Kick off auto-reconnect AFTER the UI has been populated and rendered, and
+  // without awaiting it — a slow, hanging, or failing restore can therefore
+  // never delay or block the patchbay from showing. Newly re-established links
+  // appear on the next refresh cycle.
+  reconnectSavedConnections();
 }
 
 // ─── Auto-refresh ─────────────────────────────────────────────────────────────
@@ -894,17 +917,9 @@ async function init() {
   // Attempt to restore previously saved connections. Connections whose device
   // or port is not currently present are skipped silently by the backend and
   // retried automatically on later refreshes, so only genuine link failures
-  // (both endpoints present, link still failed) are reported here.
-  try {
-    const errors = await invoke('restore_connections');
-    if (errors.length > 0) {
-      showErrorBanner(
-        `Some saved connections failed to restore: ${errors.join('; ')}`
-      );
-    }
-  } catch (_) {
-    // Non-fatal: proceed even if restore fails
-  }
+  // (both endpoints present, link still failed) are reported here. Fire it
+  // without awaiting so a slow/failing restore never delays the first paint.
+  reconnectSavedConnections({ surfaceErrors: true });
 
   refresh();
   startAutoRefresh();
