@@ -7,5 +7,6 @@
 //! binaries share one audited backend verbatim.
 
 pub mod pipewire;
+pub mod vsinks;
 
 pub mod app;

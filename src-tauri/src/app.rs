@@ -17,14 +17,15 @@
 use eframe::egui;
 use egui::accesskit::{Live, Role};
 use egui::{
-    Align, Align2, Color32, Id, Key, Layout, Margin, Order, Pos2, Rect, Rounding, Sense, Shape,
-    Stroke, Vec2,
+    Align, Align2, Color32, FontId, Id, Key, Layout, Margin, Order, Pos2, Rect, Rounding, Sense,
+    Shape, Stroke, Vec2,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
-use crate::pipewire::{self, Link, Port, VirtualSink};
+use crate::pipewire::{self, Link, NodeLabel, Port, VirtualSink};
+use crate::vsinks::{self, DeletePlan, LiveSink, SinkRow, SinkState, SinkTarget};
 
 // ─── Theme tokens (mirror ui/style.css :root) ──────────────────────────────
 const BG: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x2e);
@@ -61,12 +62,42 @@ fn cable_color(index: usize) -> Color32 {
 
 const STEREO_PORT_NAMES: [&str; 4] = ["playback_FL", "playback_FR", "capture_FL", "capture_FR"];
 const DOT_SIZE: f32 = 12.0;
+/// Minimum width of each side column. Columns grow beyond this to fit their
+/// card labels (see [`column_width`]).
 const COL_WIDTH: f32 = 320.0;
+/// Upper bound for a content-sized side column.
+const COL_MAX_WIDTH: f32 = 520.0;
+/// Horizontal room always left for the centre cable zone when columns widen.
+const CABLE_ZONE_MIN: f32 = 160.0;
+/// Extra column width so content never sits under the floating scroll bar.
+const COL_SLACK: f32 = 8.0;
+/// Card outer margin, left/right (the gap between a card and its column edge).
+const CARD_OUTER_X: f32 = 12.0;
+/// Card inner padding: the same on left/right (`X`) and top/bottom (`Y`) for
+/// every card. In egui points, so already scaled for DPI.
+const CARD_PAD_X: f32 = 10.0;
+const CARD_PAD_Y: f32 = 8.0;
+/// Vertical gap between stacked cards; matches the inner vertical padding.
+const CARD_GAP: f32 = CARD_PAD_Y;
+/// Vertical gap between a card's lines (title → subtitle → port rows).
+const LINE_GAP: f32 = 3.0;
+/// Gap between a port dot and its text.
+const DOT_GAP: f32 = 8.0;
+/// Port-dot gutter on a card's cable side. Every line of a card (title,
+/// subtitle, port rows) reserves it, so all text shares one edge.
+const DOT_GUTTER: f32 = DOT_SIZE + DOT_GAP;
+/// Font sizes of a card's title line and its dim sub-lines / port rows.
+const TITLE_SIZE: f32 = 14.0;
+const SUB_SIZE: f32 = 11.0;
 const REFRESH_SECS: u64 = 3;
 /// Fixed height of a single port row. Bounding the row height keeps node cards
 /// sized to their content (and stacked from the top) instead of stretching to
 /// fill the column — and keeps each port dot anchored on its own row.
 const ROW_H: f32 = 20.0;
+/// Slot at the end of a virtual-sink card's title line for its hover-revealed
+/// delete button. Always reserved (button shown or not), so the title elides
+/// the same and the card never changes size when the button appears.
+const DELETE_SLOT: f32 = ROW_H + 4.0;
 /// Width of the "New Virtual Sink" modal card (matches the old `.modal-card-sm`).
 const MODAL_W: f32 = 340.0;
 
@@ -77,7 +108,9 @@ struct Snapshot {
     outputs: Vec<Port>,
     inputs: Vec<Port>,
     links: Vec<Link>,
-    node_names: HashMap<String, String>,
+    node_labels: HashMap<String, NodeLabel>,
+    /// Live AudioPlumber sinks (`None` when pw-dump is unavailable).
+    live_sinks: Option<Vec<LiveSink>>,
 }
 
 /// Commands sent from the UI thread to the backend worker thread. All blocking
@@ -89,7 +122,7 @@ enum Cmd {
     /// Startup restore: errors ARE surfaced to the banner.
     InitRestore,
     CheckDeps,
-    /// Recreate persisted sinks whose ports are absent (startup J6 flow).
+    /// Recreate persisted sinks that are not loaded (startup J6 flow).
     EnsureSinks(Vec<VirtualSink>),
     Connect(Vec<(String, String)>),
     Disconnect(Vec<(String, String)>),
@@ -98,7 +131,7 @@ enum Cmd {
         sinks: Vec<VirtualSink>,
     },
     DeleteSink {
-        module_id: u32,
+        target: SinkTarget,
         sinks: Vec<VirtualSink>,
     },
     FetchDebug,
@@ -135,7 +168,8 @@ fn poll_snapshot() -> Snapshot {
         outputs: pipewire::get_outputs(),
         inputs: pipewire::get_inputs(),
         links: pipewire::get_links(),
-        node_names: pipewire::get_node_names(),
+        node_labels: pipewire::get_node_labels(),
+        live_sinks: vsinks::list_live_sinks(),
     }
 }
 
@@ -156,25 +190,32 @@ fn handle_cmd(cmd: Cmd, evt: &Sender<Evt>) {
             let _ = evt.send(Evt::DepsMissing(pipewire::check_deps()));
         }
         Cmd::EnsureSinks(mut sinks) => {
-            let outputs = pipewire::get_outputs();
-            let mut changed = false;
-            for vs in &mut sinks {
-                if virtual_sink_ports_present(&vs.name, &outputs) {
-                    continue;
-                }
-                match pipewire::create_virtual_sink(&vs.name) {
-                    Ok(id) => {
-                        vs.module_id = id;
-                        changed = true;
+            // Recreate only sinks verifiably absent from PipeWire's sink list;
+            // if that list cannot be read, recreating blindly is exactly how
+            // duplicate sinks appear, so do nothing.
+            if let Some(live) = vsinks::list_live_sinks() {
+                let (mut changed, missing) = vsinks::reconcile_saved(&mut sinks, &live);
+                let mut recreated = false;
+                for i in missing {
+                    match pipewire::create_virtual_sink(&sinks[i].name) {
+                        Ok(id) => {
+                            sinks[i].module_id = id;
+                            changed = true;
+                            recreated = true;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to recreate virtual sink \"{}\": {}", sinks[i].name, e);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to recreate virtual sink \"{}\": {}", vs.name, e);
-                    }
                 }
-            }
-            if changed {
-                let _ = pipewire::save_virtual_sinks(&sinks);
-                std::thread::sleep(Duration::from_millis(500));
+                if changed {
+                    let _ = pipewire::save_virtual_sinks(&sinks);
+                }
+                if recreated {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            } else {
+                eprintln!("EnsureSinks: pw-dump unavailable; not recreating virtual sinks");
             }
             let _ = evt.send(Evt::SinksChanged(sinks));
             let _ = evt.send(Evt::Snapshot(poll_snapshot()));
@@ -208,6 +249,17 @@ fn handle_cmd(cmd: Cmd, evt: &Sender<Evt>) {
                 let _ = evt.send(Evt::DisconnectError(errors.join("; ")));
             }
         }
+        // Duplicate-name policy: refuse. pipewire-pulse would happily load a
+        // second sink with the same node.name, whose ports are then
+        // indistinguishable from the first one's.
+        Cmd::CreateSink { name, sinks }
+            if vsinks::name_taken(&name, &sinks, vsinks::list_live_sinks().as_deref()) =>
+        {
+            let _ = evt.send(Evt::CreateSinkError(format!(
+                "A virtual sink named \"{}\" already exists. Choose a different name.",
+                name
+            )));
+        }
         Cmd::CreateSink { name, mut sinks } => match pipewire::create_virtual_sink(&name) {
             Ok(module_id) => {
                 sinks.push(VirtualSink { name, module_id });
@@ -223,19 +275,33 @@ fn handle_cmd(cmd: Cmd, evt: &Sender<Evt>) {
                 )));
             }
         },
-        Cmd::DeleteSink { module_id, mut sinks } => {
-            match pipewire::delete_virtual_sink(module_id) {
-                Ok(()) => {
-                    sinks.retain(|v| v.module_id != module_id);
-                    let _ = pipewire::save_virtual_sinks(&sinks);
-                    let snap = poll_snapshot();
-                    let _ = pipewire::save_connections(snap.links.clone());
-                    let _ = evt.send(Evt::SinksChanged(sinks));
-                    let _ = evt.send(Evt::Snapshot(snap));
+        Cmd::DeleteSink { target, sinks } => {
+            // Only a module verified to be a live AudioPlumber sink is unloaded
+            // (pipewire-pulse reuses module ids, so a stale id is unsafe).
+            let live = vsinks::list_live_sinks();
+            let remaining = match vsinks::plan_delete(&target, &sinks, live.as_deref()) {
+                DeletePlan::Unload { module_id, remaining } => {
+                    match pipewire::delete_virtual_sink(module_id) {
+                        Ok(()) => remaining,
+                        // Parity: delete failure is invisible (old code only setStatus()'d).
+                        Err(e) => {
+                            eprintln!("Failed to unload virtual sink module {}: {}", module_id, e);
+                            return;
+                        }
+                    }
                 }
-                // Parity: delete failure is invisible (old code only setStatus()'d).
-                Err(_) => {}
-            }
+                DeletePlan::Forget { remaining } => remaining,
+                DeletePlan::Refuse => {
+                    eprintln!("Not deleting {:?}: not a live AudioPlumber sink", target);
+                    let _ = evt.send(Evt::Snapshot(poll_snapshot()));
+                    return;
+                }
+            };
+            let _ = pipewire::save_virtual_sinks(&remaining);
+            let snap = poll_snapshot();
+            let _ = pipewire::save_connections(snap.links.clone());
+            let _ = evt.send(Evt::SinksChanged(remaining));
+            let _ = evt.send(Evt::Snapshot(snap));
         }
         Cmd::FetchDebug => {
             let _ = evt.send(Evt::DebugInfo(pipewire::get_debug_info()));
@@ -243,16 +309,6 @@ fn handle_cmd(cmd: Cmd, evt: &Sender<Evt>) {
     }
 }
 
-/// Fuzzy check: does a virtual sink's null-sink currently expose ports? (PipeWire
-/// may append a `.2` / `_1` suffix to the requested sink_name.)
-fn virtual_sink_ports_present(name: &str, outputs: &[Port]) -> bool {
-    let node = format!("AudioPlumber_{}", name);
-    outputs.iter().any(|p| {
-        p.node == node
-            || p.node.starts_with(&format!("{}.", node))
-            || p.node.starts_with(&format!("{}_", node))
-    })
-}
 
 fn node_name_from_port_id(port_id: &str) -> String {
     match port_id.find(':') {
@@ -296,8 +352,13 @@ pub struct AudioPlumberApp {
     outputs: Vec<Port>,
     inputs: Vec<Port>,
     links: Vec<Link>,
-    node_names: HashMap<String, String>,
+    node_labels: HashMap<String, NodeLabel>,
+    /// Saved definitions (`virtual_sinks.json`), used to recreate sinks.
     virtual_sinks: Vec<VirtualSink>,
+    /// Live AudioPlumber sinks from the last snapshot.
+    live_sinks: Option<Vec<LiveSink>>,
+    /// Left-column cards: `virtual_sinks` reconciled with `live_sinks`.
+    sink_rows: Vec<SinkRow>,
 
     // UI state
     simple_mode: bool,
@@ -310,7 +371,7 @@ pub struct AudioPlumberApp {
     debug_text: String,
 
     // Per-frame hover memory for card-hover-reveal (1-frame lag, smooth).
-    sink_card_rects: HashMap<String, Rect>,
+    sink_card_rects: HashMap<SinkTarget, Rect>,
     // Cable the cursor is hovering this frame (for click-to-disconnect).
     hovered_cable: Option<CableId>,
 }
@@ -348,8 +409,10 @@ impl AudioPlumberApp {
             outputs: Vec::new(),
             inputs: Vec::new(),
             links: Vec::new(),
-            node_names: HashMap::new(),
+            node_labels: HashMap::new(),
+            sink_rows: vsinks::build_rows(&virtual_sinks, None),
             virtual_sinks,
+            live_sinks: None,
             simple_mode: true,
             pending: None,
             error_banner: None,
@@ -370,9 +433,16 @@ impl AudioPlumberApp {
                     self.outputs = s.outputs;
                     self.inputs = s.inputs;
                     self.links = s.links;
-                    self.node_names = s.node_names;
+                    self.node_labels = s.node_labels;
+                    self.live_sinks = s.live_sinks;
+                    self.sink_rows =
+                        vsinks::build_rows(&self.virtual_sinks, self.live_sinks.as_deref());
                 }
-                Evt::SinksChanged(list) => self.virtual_sinks = list,
+                Evt::SinksChanged(list) => {
+                    self.virtual_sinks = list;
+                    self.sink_rows =
+                        vsinks::build_rows(&self.virtual_sinks, self.live_sinks.as_deref());
+                }
                 Evt::DepsMissing(missing) => {
                     if !missing.is_empty() {
                         self.error_banner = Some(format!(
@@ -606,14 +676,284 @@ fn port_dot(
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('\u{2026}');
-        out
+// ─── Card labels & sizing ──────────────────────────────────────────────────
+
+/// Where to cut a label that does not fit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Elide {
+    /// Keep the start (the label leads with its distinguishing part).
+    End,
+    /// Keep both ends (for unsplit labels, whose distinguishing part is
+    /// usually at the end, e.g. `alsa_output…HiFi__Speaker__sink`).
+    Middle,
+}
+
+/// Shorten `text` with an ellipsis until `measure` says it fits in `max_w`.
+fn elide_to_width(text: &str, max_w: f32, mode: Elide, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_w {
+        return text.to_string();
     }
+    let chars: Vec<char> = text.chars().collect();
+    let build = |keep: usize| -> String {
+        match mode {
+            Elide::End => {
+                let head: String = chars[..keep].iter().collect();
+                format!("{}\u{2026}", head.trim_end())
+            }
+            Elide::Middle => {
+                let head_n = keep / 2;
+                let head: String = chars[..head_n].iter().collect();
+                let tail: String = chars[chars.len() - (keep - head_n)..].iter().collect();
+                format!("{}\u{2026}{}", head.trim_end(), tail.trim_start())
+            }
+        }
+    };
+    // Largest number of kept characters whose elided form still fits.
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if measure(&build(mid)) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    build(lo)
+}
+
+fn text_width(ctx: &egui::Context, text: &str, size: f32) -> f32 {
+    ctx.fonts(|f| {
+        f.layout_no_wrap(text.to_string(), FontId::proportional(size), TEXT)
+            .size()
+            .x
+    })
+}
+
+/// `text` elided to fit `max_w` at font `size`.
+fn fit_text(ui: &egui::Ui, text: &str, size: f32, max_w: f32, mode: Elide) -> String {
+    let ctx = ui.ctx();
+    elide_to_width(text, max_w.max(0.0), mode, |s| text_width(ctx, s, size))
+}
+
+/// Byte length of the longest whole-word prefix `a` shares with `b`: the
+/// prefix must be followed by whitespace in `a` (and whitespace or the end of
+/// `b`). Returns 0 when they share no whole word.
+fn common_word_prefix(a: &str, b: &str) -> usize {
+    let mut last = 0;
+    let mut bi = b.chars();
+    for (i, ca) in a.char_indices() {
+        let cb = bi.next();
+        if ca.is_whitespace() && cb.is_none_or(char::is_whitespace) {
+            last = i;
+        }
+        if cb != Some(ca) {
+            break;
+        }
+    }
+    last
+}
+
+/// Split a node description into `(distinguishing, shared)` parts so sibling
+/// outputs of one controller can be told apart, e.g.
+/// "Meteor Lake-P HD Audio Controller Speaker" →
+/// ("Speaker", Some("Meteor Lake-P HD Audio Controller")).
+///
+/// Tried in order: the parent device name as a prefix; the longest multi-word
+/// prefix shared with another visible card (`siblings`); the node nick as a
+/// suffix. Falls back to the whole description with no shared part.
+fn split_description(
+    desc: &str,
+    device: Option<&str>,
+    nick: Option<&str>,
+    siblings: &[&str],
+) -> (String, Option<String>) {
+    let desc = desc.trim();
+
+    if let Some(dev) = device.map(str::trim).filter(|d| !d.is_empty()) {
+        if let Some(rest) = desc.strip_prefix(dev) {
+            if rest.starts_with(char::is_whitespace) && !rest.trim().is_empty() {
+                return (rest.trim().to_string(), Some(dev.to_string()));
+            }
+        }
+    }
+
+    let shared = siblings
+        .iter()
+        .map(|s| common_word_prefix(desc, s.trim()))
+        .max()
+        .unwrap_or(0);
+    if shared > 0 {
+        let (pre, rest) = (desc[..shared].trim(), desc[shared..].trim());
+        // Require 2+ shared words so a lone common word ("HDMI", "USB") is not
+        // mistaken for the device name.
+        if pre.contains(char::is_whitespace) && !rest.is_empty() {
+            return (rest.to_string(), Some(pre.to_string()));
+        }
+    }
+
+    if let Some(nick) = nick.map(str::trim).filter(|n| !n.is_empty()) {
+        if let Some(pre) = desc.strip_suffix(nick) {
+            if pre.ends_with(char::is_whitespace) && !pre.trim().is_empty() {
+                return (nick.to_string(), Some(pre.trim().to_string()));
+            }
+        }
+    }
+
+    (desc.to_string(), None)
+}
+
+/// Display text for an output node card.
+struct CardLabel {
+    /// Title line: the part that differs between sibling outputs.
+    primary: String,
+    /// Dim sub-line: the shared controller/device name, else the raw node name
+    /// (empty when that would just repeat `primary`).
+    secondary: String,
+    /// How to elide `primary` if it still does not fit.
+    primary_elide: Elide,
+    /// Full, untruncated description (tooltip).
+    description: String,
+}
+
+fn card_label(node_name: &str, info: Option<&NodeLabel>, siblings: &[&str]) -> CardLabel {
+    let description = info
+        .map(|l| l.description.clone())
+        .unwrap_or_else(|| node_name.to_string());
+    let (primary, shared) = split_description(
+        &description,
+        info.and_then(|l| l.device.as_deref()),
+        info.and_then(|l| l.nick.as_deref()),
+        siblings,
+    );
+    let primary_elide = if shared.is_some() { Elide::End } else { Elide::Middle };
+    let secondary = shared.unwrap_or_else(|| {
+        if node_name == primary {
+            String::new()
+        } else {
+            node_name.to_string()
+        }
+    });
+    CardLabel {
+        primary,
+        secondary,
+        primary_elide,
+        description,
+    }
+}
+
+/// One card in the right ("Outputs") column.
+struct OutputCard<'a> {
+    node_name: &'a str,
+    ports: Vec<&'a Port>,
+    label: CardLabel,
+}
+
+/// The right-column cards (input ports grouped by node, first-seen order,
+/// filtered as before), with labels split against each other.
+fn output_cards(app: &AudioPlumberApp) -> Vec<OutputCard<'_>> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut by_node: HashMap<&str, Vec<&Port>> = HashMap::new();
+    for p in &app.inputs {
+        if !by_node.contains_key(p.node.as_str()) {
+            order.push(&p.node);
+        }
+        by_node.entry(&p.node).or_default().push(p);
+    }
+
+    let shown: Vec<(&str, Vec<&Port>)> = order
+        .into_iter()
+        .filter_map(|node_name| {
+            let ports = by_node.remove(node_name)?;
+            let lower = node_name.to_lowercase();
+            let keep = !node_name.starts_with("AudioPlumber_")
+                && !lower.contains("midi") // MIDI excluded from the right column
+                && !lower.starts_with("bluez_capture_internal")
+                && ports.iter().any(|p| STEREO_PORT_NAMES.contains(&p.port.as_str()));
+            keep.then_some((node_name, ports))
+        })
+        .collect();
+
+    let descs: Vec<&str> = shown
+        .iter()
+        .map(|(n, _)| app.node_labels.get(*n).map_or(*n, |l| l.description.as_str()))
+        .collect();
+
+    shown
+        .into_iter()
+        .enumerate()
+        .map(|(i, (node_name, ports))| {
+            let siblings: Vec<&str> = descs
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, d)| *d)
+                .collect();
+            let label = card_label(node_name, app.node_labels.get(node_name), &siblings);
+            OutputCard {
+                node_name,
+                ports,
+                label,
+            }
+        })
+        .collect()
+}
+
+/// Output ports belonging to a virtual-sink card (exact `node.name` match for
+/// live sinks; none for duplicated names — see [`vsinks::row_owns_port`]).
+fn sink_ports<'a>(app: &'a AudioPlumberApp, vs: &SinkRow) -> Vec<&'a Port> {
+    app.outputs
+        .iter()
+        .filter(|p| vsinks::row_owns_port(vs, &p.node))
+        .collect()
+}
+
+/// Column width a card needs to show its title (plus `title_extra` points
+/// reserved after it on the same line) and its sub-lines (`rows`) without
+/// eliding: the widest line plus the dot gutter, the inner padding and the
+/// outer margin. Mirrors the layout in [`card_row`].
+fn card_needed_width<'a>(
+    ctx: &egui::Context,
+    title: &str,
+    title_extra: f32,
+    rows: impl IntoIterator<Item = &'a str>,
+) -> f32 {
+    let text_w = rows
+        .into_iter()
+        .map(|t| text_width(ctx, t, SUB_SIZE))
+        .fold(text_width(ctx, title, TITLE_SIZE) + title_extra, f32::max);
+    text_w + DOT_GUTTER + 2.0 * (CARD_PAD_X + CARD_OUTER_X)
+}
+
+/// Side-column width: sized to `content_w`, never below [`COL_WIDTH`], and
+/// capped so the centre cable zone keeps at least [`CABLE_ZONE_MIN`].
+fn column_width(screen_w: f32, content_w: f32) -> f32 {
+    let cap = ((screen_w - CABLE_ZONE_MIN) / 2.0).clamp(COL_WIDTH, COL_MAX_WIDTH);
+    (content_w + COL_SLACK).clamp(COL_WIDTH, cap)
+}
+
+fn left_column_width(ctx: &egui::Context, app: &AudioPlumberApp) -> f32 {
+    let content = app
+        .sink_rows
+        .iter()
+        .map(|vs| {
+            let ports = sink_ports(app, vs);
+            let rows = std::iter::once(vs.label.as_str()).chain(ports.iter().map(|p| p.port.as_str()));
+            card_needed_width(ctx, &vs.label, DELETE_SLOT, rows)
+        })
+        .fold(0.0, f32::max);
+    column_width(ctx.screen_rect().width(), content)
+}
+
+fn right_column_width(ctx: &egui::Context, cards: &[OutputCard<'_>]) -> f32 {
+    let content = cards
+        .iter()
+        .map(|c| {
+            let rows = std::iter::once(c.label.secondary.as_str())
+                .chain(c.ports.iter().map(|p| p.port.as_str()));
+            card_needed_width(ctx, &c.label.primary, 0.0, rows)
+        })
+        .fold(0.0, f32::max);
+    column_width(ctx.screen_rect().width(), content)
 }
 
 /// Outcome of the (self-immutable) rendering pass, applied to `self` afterwards.
@@ -625,13 +965,13 @@ struct FrameOut {
     refresh_clicked: bool,
     mode_clicked: bool,
     new_sink_clicked: bool,
-    delete_sink: Option<u32>,
+    delete_sink: Option<SinkTarget>,
     banner_dismissed: bool,
     modal_cancel: bool,
     modal_confirm: bool,
     modal_rect: Option<Rect>,
     patchbay_clip: Option<Rect>,
-    card_rects: HashMap<String, Rect>,
+    card_rects: HashMap<SinkTarget, Rect>,
 }
 
 impl eframe::App for AudioPlumberApp {
@@ -742,10 +1082,15 @@ impl eframe::App for AudioPlumberApp {
                     });
             }
 
+            // Column widths follow their card labels (bounded; see column_width).
+            let cards = output_cards(this);
+            let left_w = left_column_width(ctx, this);
+            let right_w = right_column_width(ctx, &cards);
+
             // ── Left column: virtual sinks ──
             let left = egui::SidePanel::left("vsinks")
                 .resizable(false)
-                .exact_width(COL_WIDTH)
+                .exact_width(left_w)
                 .frame(egui::Frame::none().fill(BG).inner_margin(Margin::symmetric(0.0, 12.0)))
                 .show(ctx, |ui| {
                     column_header(ui, "Virtual Sinks", Some("\u{ff0b} New Virtual Sink"), &mut out.new_sink_clicked);
@@ -757,12 +1102,12 @@ impl eframe::App for AudioPlumberApp {
             // ── Right column: real outputs ──
             egui::SidePanel::right("outputs")
                 .resizable(false)
-                .exact_width(COL_WIDTH)
+                .exact_width(right_w)
                 .frame(egui::Frame::none().fill(BG).inner_margin(Margin::symmetric(0.0, 12.0)))
                 .show(ctx, |ui| {
                     column_header(ui, "Outputs (auto)", None, &mut out.new_sink_clicked);
                     egui::ScrollArea::vertical().id_source("right_scroll").show(ui, |ui| {
-                        render_right_column(ui, this, &connected_in, &mut out);
+                        render_right_column(ui, this, &cards, &connected_in, &mut out);
                     });
                 });
 
@@ -820,21 +1165,78 @@ fn card_frame(virtual_sink: bool) -> egui::Frame {
         .fill(SURFACE)
         .stroke(Stroke::new(1.0_f32, if virtual_sink { TEAL_BORDER } else { CARD_BORDER }))
         .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(0.0, 10.0))
+        .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
         .outer_margin(Margin {
-            left: 12.0,
-            right: 12.0,
+            left: CARD_OUTER_X,
+            right: CARD_OUTER_X,
             top: 0.0,
-            bottom: 8.0,
+            bottom: CARD_GAP,
         })
 }
 
-fn card_name(ui: &mut egui::Ui, name: &str, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.add_space(14.0);
-        ui.label(egui::RichText::new(truncate(name, 34)).color(color).size(14.0).strong());
+/// Start of a card's contents: span the full column width (so every card in a
+/// column is the same width) and use only explicit horizontal gaps, so text
+/// widths computed by [`card_needed_width`] match the real layout.
+fn card_body(ui: &mut egui::Ui) {
+    ui.set_min_width(ui.available_width());
+    ui.spacing_mut().item_spacing = Vec2::new(0.0, LINE_GAP);
+}
+
+/// Fills a card row's dot gutter with nothing.
+fn no_dot(ui: &mut egui::Ui) {
+    ui.add_space(DOT_SIZE);
+}
+
+/// One fixed-height ([`ROW_H`]) line of a card. The dot gutter sits on the
+/// card's cable side (left for inputs, right for outputs) and is reserved on
+/// every line; `dot` fills it (a port dot or [`no_dot`]). `text` is laid out
+/// left-aligned in the remaining width, so all lines share one text edge.
+fn card_row(
+    ui: &mut egui::Ui,
+    side: Side,
+    dot: impl FnOnce(&mut egui::Ui),
+    text: impl FnOnce(&mut egui::Ui),
+) {
+    let size = Vec2::new(ui.available_width(), ROW_H);
+    match side {
+        Side::Input => {
+            ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_size(size);
+                dot(ui);
+                ui.add_space(DOT_GAP);
+                text(ui);
+            });
+        }
+        Side::Output => {
+            ui.allocate_ui_with_layout(size, Layout::right_to_left(Align::Center), |ui| {
+                ui.set_min_size(size);
+                dot(ui);
+                ui.add_space(DOT_GAP);
+                ui.with_layout(Layout::left_to_right(Align::Center), text);
+            });
+        }
+    }
+}
+
+fn card_name(ui: &mut egui::Ui, side: Side, name: &str, color: Color32, elide: Elide) {
+    card_row(ui, side, no_dot, |ui| {
+        let text = fit_text(ui, name, TITLE_SIZE, ui.available_width(), elide);
+        ui.label(egui::RichText::new(text).color(color).size(TITLE_SIZE).strong());
     });
-    ui.add_space(4.0);
+}
+
+/// Dim sub-line label (subtitle / port name), elided to the remaining width.
+fn row_label(ui: &mut egui::Ui, text: &str) {
+    let text = fit_text(ui, text, SUB_SIZE, ui.available_width(), Elide::End);
+    ui.label(egui::RichText::new(text).color(TEXT_DIM).size(SUB_SIZE));
+}
+
+/// Card hover tooltip: the full, untruncated name(s).
+fn card_tooltip(ui: &mut egui::Ui, name: &str, detail: Option<&str>) {
+    ui.label(egui::RichText::new(name).color(TEXT).strong());
+    if let Some(d) = detail.filter(|d| !d.is_empty() && *d != name) {
+        ui.label(egui::RichText::new(d).monospace().size(SUB_SIZE).color(TEXT_DIM));
+    }
 }
 
 fn render_left_column(
@@ -843,42 +1245,62 @@ fn render_left_column(
     connected_out: &HashSet<String>,
     out: &mut FrameOut,
 ) {
-    if app.virtual_sinks.is_empty() {
+    if app.sink_rows.is_empty() {
         empty_state(ui, "No virtual sinks yet. Click \u{ff0b} New Virtual Sink to create one.");
         return;
     }
 
-    for vs in &app.virtual_sinks {
-        let node_name = format!("AudioPlumber_{}", vs.name);
-        let ports: Vec<&Port> = app
-            .outputs
-            .iter()
-            .filter(|p| {
-                p.node == node_name
-                    || p.node.starts_with(&format!("{}.", node_name))
-                    || p.node.starts_with(&format!("{}_", node_name))
-            })
-            .collect();
+    // One card per live sink (keyed by module id) or saved-but-unloaded
+    // definition (keyed by name) — see `vsinks::build_rows`.
+    for vs in &app.sink_rows {
+        let ports = sink_ports(app, vs);
 
         let show_delete = app
             .sink_card_rects
-            .get(&vs.name)
+            .get(&vs.target)
             .zip(ui.ctx().pointer_hover_pos())
             .map(|(rect, p)| rect.contains(p))
             .unwrap_or(false);
 
         let inner = card_frame(true).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            card_name(ui, &vs.name, TEAL);
+            card_body(ui);
+            // Title line: name, then the delete slot (button on hover). The
+            // slot sits in the text area, left of the (empty) dot gutter, so it
+            // never covers a port dot and adds no height to the card.
+            card_row(ui, Side::Output, no_dot, |ui| {
+                let max_w = (ui.available_width() - DELETE_SLOT).max(0.0);
+                let text = fit_text(ui, &vs.label, TITLE_SIZE, max_w, Elide::End);
+                ui.label(egui::RichText::new(text).color(TEAL).size(TITLE_SIZE).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if show_delete {
+                        let btn = egui::Button::new(
+                            egui::RichText::new("\u{1f5d1}").color(BANNER_BORDER).size(SUB_SIZE),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x5a, 0x1a, 0x1a)))
+                        .min_size(Vec2::new(ROW_H, ROW_H - 4.0));
+                        let r = ui.add(btn).on_hover_text("Delete sink");
+                        a11y(ui.ctx(), r.id, Some(&format!("Delete virtual sink {}", vs.label)), None, None);
+                        if r.clicked() {
+                            out.delete_sink = Some(vs.target.clone());
+                        }
+                    }
+                });
+            });
 
             if ports.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(14.0);
+                // Same-named sinks share port ids, so neither can be routed
+                // until one copy is deleted.
+                let status = match vs.state {
+                    SinkState::Live { duplicate: true, .. } => "Duplicate name \u{2014} delete one copy",
+                    _ => "Waiting for PipeWire\u{2026}",
+                };
+                card_row(ui, Side::Output, no_dot, |ui| {
                     ui.label(
-                        egui::RichText::new("Waiting for PipeWire\u{2026}")
+                        egui::RichText::new(status)
                             .italics()
                             .color(TEXT_DIM)
-                            .size(11.0),
+                            .size(SUB_SIZE),
                     );
                 });
             } else if app.simple_mode {
@@ -887,150 +1309,104 @@ fn render_left_column(
                 let key = DotKey::OutNode(actual_node.clone());
                 let selected = app.pending.as_ref().map(|p| p.key == key).unwrap_or(false);
                 let connected = connected_out.contains(&actual_node);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width(), ROW_H),
-                    Layout::right_to_left(Align::Center),
+                card_row(
+                    ui,
+                    Side::Output,
                     |ui| {
-                        ui.add_space(6.0);
                         port_dot(
                             ui, PORT_OUT, key, Side::Output, port_ids, selected, connected,
                             &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
                         );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(truncate(&vs.name, 30)).color(TEXT_DIM).size(11.0));
                     },
+                    |ui| row_label(ui, &vs.label),
                 );
             } else {
                 for p in &ports {
                     let key = DotKey::OutPort(p.id.clone());
                     let selected = app.pending.as_ref().map(|pd| pd.key == key).unwrap_or(false);
                     let connected = connected_out.contains(&p.node);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), ROW_H),
-                        Layout::right_to_left(Align::Center),
+                    card_row(
+                        ui,
+                        Side::Output,
                         |ui| {
-                            ui.add_space(6.0);
                             port_dot(
                                 ui, PORT_OUT, key, Side::Output, vec![p.id.clone()], selected, connected,
                                 &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
                             );
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new(truncate(&p.port, 30)).color(TEXT_DIM).size(11.0));
                         },
+                        |ui| row_label(ui, &p.port),
                     );
                 }
             }
-
-            // Hover-reveal delete button.
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                if show_delete {
-                    let btn = egui::Button::new(
-                        egui::RichText::new("Delete sink").color(BANNER_BORDER).size(11.0),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(0x5a, 0x1a, 0x1a)));
-                    let r = ui.add(btn);
-                    a11y(ui.ctx(), r.id, Some(&format!("Delete virtual sink {}", vs.name)), None, None);
-                    if r.clicked() {
-                        out.delete_sink = Some(vs.module_id);
-                    }
-                } else {
-                    ui.add_space(DOT_SIZE);
-                }
-            });
         });
 
-        out.card_rects.insert(vs.name.clone(), inner.response.rect);
+        out.card_rects.insert(vs.target.clone(), inner.response.rect);
+        inner.response.on_hover_ui(|ui| {
+            card_tooltip(ui, &vs.label, ports.first().map(|p| p.node.as_str()));
+        });
     }
 }
 
 fn render_right_column(
     ui: &mut egui::Ui,
     app: &AudioPlumberApp,
+    cards: &[OutputCard<'_>],
     connected_in: &HashSet<String>,
     out: &mut FrameOut,
 ) {
-    // Group inputs by node, preserving first-seen order.
-    let mut order: Vec<String> = Vec::new();
-    let mut by_node: HashMap<String, Vec<&Port>> = HashMap::new();
-    for p in &app.inputs {
-        if !by_node.contains_key(&p.node) {
-            order.push(p.node.clone());
-        }
-        by_node.entry(p.node.clone()).or_default().push(p);
-    }
+    for card in cards {
+        let node_name = card.node_name;
+        let ports = &card.ports;
+        let label = &card.label;
 
-    let mut any = false;
-    for node_name in &order {
-        let ports = &by_node[node_name];
-        if node_name.starts_with("AudioPlumber_") {
-            continue;
-        }
-        if node_name.to_lowercase().contains("midi") {
-            continue; // MIDI excluded from the right column
-        }
-        if node_name.to_lowercase().starts_with("bluez_capture_internal") {
-            continue;
-        }
-        if !ports.iter().any(|p| STEREO_PORT_NAMES.contains(&p.port.as_str())) {
-            continue;
-        }
-        any = true;
-
-        let display = app
-            .node_names
-            .get(node_name)
-            .cloned()
-            .unwrap_or_else(|| node_name.clone());
-
-        card_frame(false).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            card_name(ui, &display, TEXT);
+        let inner = card_frame(false).show(ui, |ui| {
+            card_body(ui);
+            card_name(ui, Side::Input, &label.primary, TEXT, label.primary_elide);
 
             if app.simple_mode {
                 let port_ids: Vec<String> = ports.iter().map(|p| p.id.clone()).collect();
-                let key = DotKey::InNode(node_name.clone());
+                let key = DotKey::InNode(node_name.to_string());
                 let selected = app.pending.as_ref().map(|p| p.key == key).unwrap_or(false);
                 let connected = connected_in.contains(node_name);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width(), ROW_H),
-                    Layout::left_to_right(Align::Center),
+                card_row(
+                    ui,
+                    Side::Input,
                     |ui| {
-                        ui.add_space(6.0);
                         port_dot(
                             ui, PORT_IN, key, Side::Input, port_ids, selected, connected,
                             &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
                         );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(truncate(&display, 30)).color(TEXT_DIM).size(11.0));
                     },
+                    |ui| row_label(ui, &label.secondary),
                 );
             } else {
+                if !label.secondary.is_empty() {
+                    card_row(ui, Side::Input, no_dot, |ui| row_label(ui, &label.secondary));
+                }
                 for p in ports {
                     let key = DotKey::InPort(p.id.clone());
                     let selected = app.pending.as_ref().map(|pd| pd.key == key).unwrap_or(false);
                     let connected = connected_in.contains(&p.node);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), ROW_H),
-                        Layout::left_to_right(Align::Center),
+                    card_row(
+                        ui,
+                        Side::Input,
                         |ui| {
-                            ui.add_space(6.0);
                             port_dot(
                                 ui, PORT_IN, key, Side::Input, vec![p.id.clone()], selected, connected,
                                 &mut out.anchors, &mut out.dot_clicks, &mut out.dot_right_clicks,
                             );
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new(truncate(&p.port, 30)).color(TEXT_DIM).size(11.0));
                         },
+                        |ui| row_label(ui, &p.port),
                     );
                 }
             }
         });
+        inner.response.on_hover_ui(|ui| {
+            card_tooltip(ui, &label.description, Some(node_name));
+        });
     }
 
-    if !any {
+    if cards.is_empty() {
         empty_state(ui, "No audio outputs found. Is PipeWire running?");
     }
 }
@@ -1331,9 +1707,9 @@ impl AudioPlumberApp {
         }
 
         // Delete sink.
-        if let Some(module_id) = out.delete_sink {
+        if let Some(target) = &out.delete_sink {
             let _ = self.cmd_tx.send(Cmd::DeleteSink {
-                module_id,
+                target: target.clone(),
                 sinks: self.virtual_sinks.clone(),
             });
         }
@@ -1418,4 +1794,122 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(AudioPlumberApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEV: &str = "Meteor Lake-P HD Audio Controller";
+
+    fn info(desc: &str, nick: Option<&str>, device: Option<&str>) -> NodeLabel {
+        NodeLabel {
+            description: desc.to_string(),
+            nick: nick.map(str::to_string),
+            device: device.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn split_uses_device_prefix() {
+        let desc = format!("{} HDMI / DisplayPort 1 Output (Stereo)", DEV);
+        let (p, s) = split_description(&desc, Some(DEV), Some("HDMI 1"), &[]);
+        assert_eq!(p, "HDMI / DisplayPort 1 Output (Stereo)");
+        assert_eq!(s.as_deref(), Some(DEV));
+    }
+
+    #[test]
+    fn split_falls_back_to_shared_sibling_prefix() {
+        let a = format!("{} Speaker", DEV);
+        let b = format!("{} HDMI / DisplayPort 2 Output (Stereo)", DEV);
+        let (p, s) = split_description(&a, None, None, &[&b]);
+        assert_eq!(p, "Speaker");
+        assert_eq!(s.as_deref(), Some(DEV));
+        // A sibling that is exactly the shared part also counts.
+        let (p, s) = split_description("Built-in Audio Analog Stereo", None, None, &["Built-in Audio"]);
+        assert_eq!(p, "Analog Stereo");
+        assert_eq!(s.as_deref(), Some("Built-in Audio"));
+    }
+
+    #[test]
+    fn split_ignores_single_shared_word() {
+        let (p, s) = split_description("HDMI Output", None, None, &["HDMI Input"]);
+        assert_eq!(p, "HDMI Output");
+        assert_eq!(s, None);
+    }
+
+    #[test]
+    fn split_uses_nick_suffix() {
+        let desc = format!("{} Speaker", DEV);
+        let (p, s) = split_description(&desc, None, Some("Speaker"), &[]);
+        assert_eq!(p, "Speaker");
+        assert_eq!(s.as_deref(), Some(DEV));
+    }
+
+    #[test]
+    fn split_keeps_unsplittable_description_whole() {
+        // Bluetooth-style: description == device == nick.
+        let (p, s) = split_description("WH-1000XM4", Some("WH-1000XM4"), Some("WH-1000XM4"), &[]);
+        assert_eq!(p, "WH-1000XM4");
+        assert_eq!(s, None);
+        // A nick that is the leading (shared) part is not used as the title.
+        let (p, s) = split_description("Scarlett 2i2 USB Analog Stereo", None, Some("Scarlett 2i2 USB"), &[]);
+        assert_eq!(p, "Scarlett 2i2 USB Analog Stereo");
+        assert_eq!(s, None);
+    }
+
+    #[test]
+    fn sibling_cards_get_distinct_primaries() {
+        let names = ["Speaker", "HDMI / DisplayPort 1 Output (Stereo)", "HDMI / DisplayPort 2 Output (Stereo)"];
+        let descs: Vec<String> = names.iter().map(|n| format!("{} {}", DEV, n)).collect();
+        for (i, d) in descs.iter().enumerate() {
+            let siblings: Vec<&str> = descs.iter().filter(|o| *o != d).map(String::as_str).collect();
+            let l = card_label("node", Some(&info(d, None, Some(DEV))), &siblings);
+            assert_eq!(l.primary, names[i]);
+            assert_eq!(l.secondary, DEV);
+            assert_eq!(l.description, *d);
+            assert_eq!(l.primary_elide, Elide::End);
+        }
+    }
+
+    #[test]
+    fn card_label_without_metadata_uses_node_name() {
+        let n = "alsa_output.pci-0000_00_1f.3.HiFi__Speaker__sink";
+        let l = card_label(n, None, &[]);
+        assert_eq!(l.primary, n);
+        assert_eq!(l.secondary, "");
+        assert_eq!(l.primary_elide, Elide::Middle);
+        // Unsplit description: the raw node name becomes the sub-line.
+        let l = card_label("bluez_output.AA_BB.1", Some(&info("WH-1000XM4", None, None)), &[]);
+        assert_eq!(l.primary, "WH-1000XM4");
+        assert_eq!(l.secondary, "bluez_output.AA_BB.1");
+    }
+
+    /// 1 unit per char.
+    fn chars(s: &str) -> f32 {
+        s.chars().count() as f32
+    }
+
+    #[test]
+    fn elide_end_and_middle() {
+        assert_eq!(elide_to_width("Speaker", 7.0, Elide::End, chars), "Speaker");
+        assert_eq!(elide_to_width("Headphones", 6.0, Elide::End, chars), "Headp\u{2026}");
+        assert_eq!(elide_to_width("abcdefghij", 7.0, Elide::Middle, chars), "abc\u{2026}hij");
+        assert_eq!(elide_to_width("abc", 0.0, Elide::End, chars), "\u{2026}");
+        // Trailing whitespace before the ellipsis is dropped.
+        assert_eq!(elide_to_width("HDMI / DisplayPort", 8.0, Elide::End, chars), "HDMI /\u{2026}");
+    }
+
+    #[test]
+    fn column_width_bounds() {
+        // Short content keeps the historical minimum.
+        assert_eq!(column_width(1200.0, 100.0), COL_WIDTH);
+        // Content-sized in between.
+        assert_eq!(column_width(1200.0, 400.0), 400.0 + COL_SLACK);
+        // Capped by the max width…
+        assert_eq!(column_width(3000.0, 900.0), COL_MAX_WIDTH);
+        // …and by the window, leaving room for cables, but never below the minimum.
+        assert_eq!(column_width(900.0, 900.0), (900.0 - CABLE_ZONE_MIN) / 2.0);
+        assert_eq!(column_width(700.0, 900.0), COL_WIDTH);
+    }
 }

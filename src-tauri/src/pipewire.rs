@@ -169,10 +169,22 @@ pub fn disconnect(from: &str, to: &str) -> Result<(), String> {
     run_pw_link_cmd(&["-d", from, to]).map(|_| ())
 }
 
+/// Loads a `module-null-sink` named `AudioPlumber_<name>` and returns its module
+/// id. The sink is tagged with `audioplumber.managed=true` and
+/// `audioplumber.name=<name>` so it is recognisable as ours across restarts
+/// (see [`crate::vsinks`]). Duplicate-name checks are the caller's job:
+/// pipewire-pulse does not reject a second sink with the same `sink_name`.
+///
+/// `name` must not contain whitespace or quotes: pipewire-pulse splits
+/// `sink_properties` on whitespace even inside quotes. The UI sanitises names.
 pub fn create_virtual_sink(name: &str) -> Result<u32, String> {
     let pactl = find_binary("pactl");
-    let sink_name = format!("AudioPlumber_{}", name);
-    let sink_props = format!("device.description=\"{}\"", name);
+    let sink_name = format!("{}{}", crate::vsinks::SINK_PREFIX, name);
+    let sink_props = format!(
+        "device.description=\"{name}\" {}=true {}=\"{name}\"",
+        crate::vsinks::MANAGED_PROP,
+        crate::vsinks::NAME_PROP,
+    );
     let output = Command::new(&pactl)
         .args([
             "load-module",
@@ -211,6 +223,16 @@ pub fn delete_virtual_sink(module_id: u32) -> Result<(), String> {
     }
 }
 
+/// Runs `pw-dump` and returns its parsed JSON document, or `None` if the tool
+/// is unavailable, fails, or prints something unparseable.
+pub fn pw_dump_json() -> Option<serde_json::Value> {
+    let output = Command::new(find_binary("pw-dump")).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
 /// Returns a list of tool names that are not found on the system.
 pub fn check_deps() -> Vec<String> {
     let mut missing = Vec::new();
@@ -223,9 +245,23 @@ pub fn check_deps() -> Vec<String> {
     missing
 }
 
-/// Runs pw-dump and returns a map of node.name → human-readable description
+/// Human-readable labelling metadata for one audio node, as reported by
+/// `pw-dump`. Used purely for display; routing is keyed on `node.name`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeLabel {
+    /// `node.description` (falls back to `node.nick`, then `node.name`), e.g.
+    /// "Meteor Lake-P HD Audio Controller HDMI / DisplayPort 1 Output (Stereo)".
+    pub description: String,
+    /// `node.nick`, e.g. "Speaker" / "HDMI 1", when present.
+    pub nick: Option<String>,
+    /// `device.description` of the parent PipeWire device (via the node's
+    /// `device.id`), e.g. the shared "Meteor Lake-P HD Audio Controller".
+    pub device: Option<String>,
+}
+
+/// Runs pw-dump and returns a map of node.name → labelling metadata
 /// for all Audio/Sink, Audio/Source, and Audio/Duplex nodes.
-pub fn get_node_names() -> HashMap<String, String> {
+pub fn get_node_labels() -> HashMap<String, NodeLabel> {
     let pw_dump = find_binary("pw-dump");
     let output = match Command::new(&pw_dump).output() {
         Ok(o) => o,
@@ -242,7 +278,38 @@ pub fn get_node_names() -> HashMap<String, String> {
         Err(_) => return HashMap::new(),
     };
 
+    parse_node_labels(&json)
+}
+
+fn non_empty_str(v: Option<&serde_json::Value>) -> Option<String> {
+    v.and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts [`NodeLabel`]s from a parsed `pw-dump` document.
+fn parse_node_labels(json: &serde_json::Value) -> HashMap<String, NodeLabel> {
     let mut map = HashMap::new();
+
+    // Device object id → device.description, for the per-node `device` field.
+    let mut devices: HashMap<u64, String> = HashMap::new();
+    if let Some(arr) = json.as_array() {
+        for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Device") {
+                continue;
+            }
+            let id = item.get("id").and_then(|i| i.as_u64());
+            let desc = non_empty_str(
+                item.get("info")
+                    .and_then(|i| i.get("props"))
+                    .and_then(|p| p.get("device.description")),
+            );
+            if let (Some(id), Some(desc)) = (id, desc) {
+                devices.insert(id, desc);
+            }
+        }
+    }
 
     if let Some(arr) = json.as_array() {
         for item in arr {
@@ -277,7 +344,20 @@ pub fn get_node_names() -> HashMap<String, String> {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| node_name.clone());
 
-            map.insert(node_name, description);
+            let nick = non_empty_str(props.get("node.nick"));
+            let device = props
+                .get("device.id")
+                .and_then(|v| v.as_u64())
+                .and_then(|id| devices.get(&id).cloned());
+
+            map.insert(
+                node_name,
+                NodeLabel {
+                    description,
+                    nick,
+                    device,
+                },
+            );
         }
     }
 
@@ -422,7 +502,7 @@ pub fn get_debug_info() -> String {
 /// null-sink module id returned by `create_virtual_sink`; it becomes stale across
 /// a PipeWire restart and is refreshed by the startup "recreate missing sinks"
 /// flow.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct VirtualSink {
     pub name: String,
     #[serde(rename = "moduleId", alias = "module_id")]
@@ -532,31 +612,67 @@ fn scan_dir_for_sinks(dir: &std::path::Path, depth: usize) -> Option<Vec<Virtual
 }
 
 /// Find the legacy key in a byte blob and parse the JSON array that follows it.
+///
+/// WebKitGTK stores localStorage values as UTF-16LE (the key itself is UTF-8),
+/// so each occurrence of the key (UTF-8 or UTF-16LE) is tried with the value
+/// decoded as UTF-8 and then as UTF-16LE.
 fn extract_sinks_from_bytes(bytes: &[u8]) -> Option<Vec<VirtualSink>> {
-    let text = String::from_utf8_lossy(bytes);
-    let key = "audioplumber_virtual_sinks";
-    let key_at = text.find(key)?;
-    // Find the first '[' after the key and scan to its matching ']'.
-    let after = &text[key_at + key.len()..];
-    let start = after.find('[')?;
-    let slice = &after[start..];
+    const KEY: &str = "audioplumber_virtual_sinks";
+    let key_utf16: Vec<u8> = KEY.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    for key in [KEY.as_bytes(), key_utf16.as_slice()] {
+        let mut from = 0;
+        while let Some(pos) = bytes[from..].windows(key.len()).position(|w| w == key) {
+            let after = &bytes[from + pos + key.len()..];
+            if let Some(found) = json_array_utf8(after).or_else(|| json_array_utf16le(after)) {
+                return Some(found);
+            }
+            from += pos + 1;
+        }
+    }
+    None
+}
+
+/// Scans `chars` from an opening '[' to its matching ']' and returns the
+/// number of chars consumed, or `None` if unbalanced.
+fn balanced_array_len(chars: impl Iterator<Item = char>) -> Option<usize> {
     let mut depth = 0i32;
-    let mut end = None;
-    for (i, ch) in slice.char_indices() {
+    for (i, ch) in chars.enumerate() {
         match ch {
             '[' => depth += 1,
             ']' => {
                 depth -= 1;
                 if depth == 0 {
-                    end = Some(i + 1);
-                    break;
+                    return Some(i + 1);
                 }
             }
             _ => {}
         }
     }
-    let json = &slice[..end?];
-    serde_json::from_str::<Vec<VirtualSink>>(json).ok()
+    None
+}
+
+/// First JSON array in `bytes` read as UTF-8, parsed as sink definitions.
+fn json_array_utf8(bytes: &[u8]) -> Option<Vec<VirtualSink>> {
+    let text = String::from_utf8_lossy(bytes);
+    let slice = &text[text.find('[')?..];
+    let n = balanced_array_len(slice.chars())?;
+    let json: String = slice.chars().take(n).collect();
+    serde_json::from_str(&json).ok()
+}
+
+/// First JSON array in `bytes` read as UTF-16LE, parsed as sink definitions.
+fn json_array_utf16le(bytes: &[u8]) -> Option<Vec<VirtualSink>> {
+    let start = bytes.windows(2).position(|w| w == [b'[', 0])?;
+    let body = &bytes[start..];
+    let units: Vec<u16> = (0..body.len() / 2)
+        .map(|i| u16::from_le_bytes([body[2 * i], body[2 * i + 1]]))
+        .collect();
+    let chars: Vec<char> = char::decode_utf16(units)
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    let n = balanced_array_len(chars.iter().copied())?;
+    let json: String = chars[..n].iter().collect();
+    serde_json::from_str(&json).ok()
 }
 
 #[cfg(test)]
@@ -640,6 +756,62 @@ mod tests {
         assert_eq!(sinks.len(), 1);
         assert_eq!(sinks[0].name, "Rec");
         assert_eq!(sinks[0].module_id, 7);
+    }
+
+    #[test]
+    fn test_parse_node_labels() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"[
+              {"id": 60, "type": "PipeWire:Interface:Device",
+               "info": {"props": {"device.description": "Meteor Lake-P HD Audio Controller"}}},
+              {"id": 70, "type": "PipeWire:Interface:Node",
+               "info": {"props": {
+                 "media.class": "Audio/Sink",
+                 "node.name": "alsa_output.x.HiFi__Speaker__sink",
+                 "node.description": "Meteor Lake-P HD Audio Controller Speaker",
+                 "node.nick": "Speaker",
+                 "device.id": 60}}},
+              {"id": 71, "type": "PipeWire:Interface:Node",
+               "info": {"props": {"media.class": "Audio/Sink", "node.name": "bare_sink"}}},
+              {"id": 72, "type": "PipeWire:Interface:Node",
+               "info": {"props": {"media.class": "Video/Source", "node.name": "cam"}}}
+            ]"#,
+        )
+        .unwrap();
+        let labels = parse_node_labels(&json);
+        assert_eq!(labels.len(), 2);
+        let spk = &labels["alsa_output.x.HiFi__Speaker__sink"];
+        assert_eq!(spk.description, "Meteor Lake-P HD Audio Controller Speaker");
+        assert_eq!(spk.nick.as_deref(), Some("Speaker"));
+        assert_eq!(spk.device.as_deref(), Some("Meteor Lake-P HD Audio Controller"));
+        let bare = &labels["bare_sink"];
+        assert_eq!(bare.description, "bare_sink");
+        assert_eq!(bare.nick, None);
+        assert_eq!(bare.device, None);
+    }
+
+    #[test]
+    fn test_extract_sinks_from_webkit_utf16_value() {
+        // Layout observed in WebKitGTK's localstorage SQLite file: UTF-8 key
+        // immediately followed by the value as UTF-16LE.
+        let mut blob = b"\x00\x00j\x02\x04A\x81$audioplumber_virtual_sinks".to_vec();
+        let value = r#"[{"name":"test","moduleId":536870916}]"#;
+        blob.extend(value.encode_utf16().flat_map(u16::to_le_bytes));
+        blob.extend(b"\n\x00\x00\x00\x01");
+        let sinks = extract_sinks_from_bytes(&blob).expect("should extract");
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].name, "test");
+        assert_eq!(sinks[0].module_id, 536870916);
+    }
+
+    #[test]
+    fn test_extract_sinks_skips_unparseable_occurrence() {
+        // A bare key (e.g. in an index page) before the real record.
+        let mut blob = b"audioplumber_virtual_sinks\x04\x19\x03[junk".to_vec();
+        blob.extend(b"audioplumber_virtual_sinks");
+        blob.extend(r#"[{"name":"é","moduleId":1}]"#.encode_utf16().flat_map(u16::to_le_bytes));
+        let sinks = extract_sinks_from_bytes(&blob).expect("should extract");
+        assert_eq!(sinks[0].name, "é");
     }
 
     #[test]
